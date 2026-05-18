@@ -67,7 +67,7 @@ spec:
     stage('build') {
       steps {
         container('builder') {
-           sh 'armory build'
+           sh 'armory build -f Dockerfile.custom'
         }
       }
     }
