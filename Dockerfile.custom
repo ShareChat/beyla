@@ -21,15 +21,18 @@ COPY LICENSE LICENSE
 COPY NOTICE NOTICE
 COPY third_party_licenses.csv third_party_licenses.csv
 
-# Copy our modified OBI C source files (for eBPF compilation)
+# Copy our modified OBI C source files (with header_buf changes)
 COPY .obi-src/ .obi-src/
 
 ENV BPF2GO=/go/bin/bpf2go
 
-# Generate eBPF objects from our modified C source, then copy to vendor
+# Generate eBPF objects from our modified C source.
+# Skip 'make generate' (it runs git submodule update which fails because
+# our local .obi-src commit doesn't exist on upstream remote).
+# Instead, run the OBI generate directly from our copied .obi-src/.
 RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
-    make generate && \
-    make copy-obi-vendor
+    cd .obi-src && make generate && \
+    cd /src && make copy-obi-vendor
 
 # Re-apply our Go patches after copy-obi-vendor overwrites vendor files
 COPY pkg/beyla/config_obi.go pkg/beyla/config_obi.go
