@@ -21,6 +21,57 @@ import (
 	"go.opentelemetry.io/obi/pkg/internal/largebuf"
 )
 
+// extractHeadersFromBuffer manually parses HTTP headers from a potentially truncated
+// eBPF buffer. Unlike http.ReadRequest(), this handles truncated buffers gracefully
+// by extracting whatever complete header lines are available.
+func extractHeadersFromBuffer(buf *largebuf.LargeBuffer) http.Header {
+	raw := buf.UnsafeView()
+	if len(raw) == 0 {
+		return nil
+	}
+
+	headers := make(http.Header)
+
+	// Skip the request line (GET /path HTTP/1.1\r\n)
+	idx := bytes.Index(raw, []byte("\r\n"))
+	if idx < 0 {
+		return nil
+	}
+	raw = raw[idx+2:]
+
+	// Parse each header line
+	for len(raw) > 0 {
+		// End of headers
+		if len(raw) >= 2 && raw[0] == '\r' && raw[1] == '\n' {
+			break
+		}
+
+		lineEnd := bytes.Index(raw, []byte("\r\n"))
+		if lineEnd < 0 {
+			// Truncated buffer — try to parse the last partial line
+			lineEnd = len(raw)
+		}
+
+		line := raw[:lineEnd]
+		colonIdx := bytes.IndexByte(line, ':')
+		if colonIdx > 0 {
+			name := string(bytes.TrimSpace(line[:colonIdx]))
+			value := string(bytes.TrimSpace(line[colonIdx+1:]))
+			if name != "" && value != "" {
+				headers.Add(name, value)
+			}
+		}
+
+		if lineEnd+2 <= len(raw) {
+			raw = raw[lineEnd+2:]
+		} else {
+			break
+		}
+	}
+
+	return headers
+}
+
 func removeQuery(url string) string {
 	idx := strings.IndexByte(url, '?')
 	if idx > 0 {
@@ -296,16 +347,14 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
 
 	if !hasResponse {
 		// Large buffers disabled — but we can still enrich with request headers
-		// if the enrichment config is enabled. Parse request headers from the
-		// available buffer and run the enricher before falling back to the
-		// standard span builder.
+		// if the enrichment config is enabled. Manually scan the raw eBPF buffer
+		// for headers since http.ReadRequest() fails on truncated buffers.
 		if parseCtx != nil && parseCtx.httpEnricher != nil {
-			reqReader := requestBuffer.NewReader()
-			if req, err := http.ReadRequest(bufio.NewReader(&reqReader)); err == nil {
-				httpSpan := httpRequestToSpan(event, requestBuffer)
-				parseCtx.httpEnricher.Enrich(&httpSpan, req, &http.Response{Header: http.Header{}})
-				return httpSpan, false, nil
+			httpSpan := httpRequestToSpan(event, requestBuffer)
+			if headers := extractHeadersFromBuffer(requestBuffer); len(headers) > 0 {
+				parseCtx.httpEnricher.Enrich(&httpSpan, &http.Request{Header: headers}, &http.Response{Header: http.Header{}})
 			}
+			return httpSpan, false, nil
 		}
 		return httpRequestToSpan(event, requestBuffer), false, nil
 	}
