@@ -295,7 +295,19 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
 	}
 
 	if !hasResponse {
-		// Large buffers disabled
+		// Large buffers disabled — but we can still enrich with request headers
+		// if the enrichment config is enabled. Parse request headers from the
+		// available buffer and run the enricher before falling back to the
+		// standard span builder.
+		if parseCtx != nil && parseCtx.httpEnricher != nil {
+			reqBufClone := requestBuffer.Clone()
+			reqReader := reqBufClone.NewReader()
+			if req, err := http.ReadRequest(bufio.NewReader(&reqReader)); err == nil {
+				httpSpan := httpRequestToSpan(event, requestBuffer)
+				parseCtx.httpEnricher.Enrich(&httpSpan, req, &http.Response{Header: http.Header{}})
+				return httpSpan, false, nil
+			}
+		}
 		return httpRequestToSpan(event, requestBuffer), false, nil
 	}
 

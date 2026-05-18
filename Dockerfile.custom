@@ -32,6 +32,7 @@ RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
 # Re-apply our patches after copy-obi-vendor overwrites vendor files
 COPY pkg/beyla/config_obi.go pkg/beyla/config_obi.go
 COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go
+COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/http_transform.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/http_transform.go
 
 # Compile with patches applied
 RUN make compile
