@@ -9,7 +9,7 @@ WORKDIR /src
 
 RUN apk add make git bash
 
-# Copy the go manifests and source (includes our patched files)
+# Copy the go manifests and source
 COPY .git/ .git/
 COPY cmd/ cmd/
 COPY pkg/ pkg/
@@ -21,20 +21,23 @@ COPY LICENSE LICENSE
 COPY NOTICE NOTICE
 COPY third_party_licenses.csv third_party_licenses.csv
 
+# Copy our modified OBI C source files (for eBPF compilation)
+COPY .obi-src/ .obi-src/
+
 ENV BPF2GO=/go/bin/bpf2go
 
-# Generate eBPF objects (.o files) — this is required for compilation
-# copy-obi-vendor copies generated files to vendor/ (may overwrite our patches)
+# Generate eBPF objects from our modified C source, then copy to vendor
 RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
     make generate && \
     make copy-obi-vendor
 
-# Re-apply our patches after copy-obi-vendor overwrites vendor files
+# Re-apply our Go patches after copy-obi-vendor overwrites vendor files
 COPY pkg/beyla/config_obi.go pkg/beyla/config_obi.go
 COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go
 COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/http_transform.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/http_transform.go
+COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/spanner.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/spanner.go
 
-# Compile with patches applied
+# Compile with all patches applied
 RUN make compile
 
 # Final minimal image

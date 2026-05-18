@@ -4,7 +4,9 @@
 package ebpfcommon // import "go.opentelemetry.io/obi/pkg/ebpf/common"
 
 import (
+	"bytes"
 	"log/slog"
+	"net/http"
 	"strings"
 	"unsafe"
 
