@@ -27,11 +27,13 @@ COPY .obi-src/ .obi-src/
 ENV BPF2GO=/go/bin/bpf2go
 
 # Generate eBPF objects from our modified C source.
-# Skip 'make generate' (it runs git submodule update which fails because
-# our local .obi-src commit doesn't exist on upstream remote).
-# Instead, run the OBI generate directly from our copied .obi-src/.
+# Can't use parent 'make generate' (it runs git submodule update which fails
+# because our .obi-src commit doesn't exist on upstream remote).
+# Instead, run OBI's generate/all target directly.
 RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
-    cd .obi-src && make generate && \
+    cd .obi-src && \
+    BPF2GO=/go/bin/bpf2go BPF_CLANG=clang BPF_CFLAGS="-std=gnu17 -O2 -g -Wall -Werror" \
+    make generate/all && \
     cd /src && make copy-obi-vendor
 
 # Re-apply our Go patches after copy-obi-vendor overwrites vendor files
