@@ -21,31 +21,35 @@ COPY LICENSE LICENSE
 COPY NOTICE NOTICE
 COPY third_party_licenses.csv third_party_licenses.csv
 
-# Copy our modified OBI C source files (with header_buf changes)
-COPY .obi-src/ .obi-src/
-
 ENV BPF2GO=/go/bin/bpf2go
 
-# Generate eBPF objects from our modified C source.
-# Can't use parent 'make generate' (it runs git submodule update which fails
-# because our .obi-src commit doesn't exist on upstream remote).
-# Instead, run OBI's generate/all target directly.
+# Step 1: Normal generate — clones upstream OBI, compiles all eBPF objects
 RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
-    cd .obi-src && \
+    make generate && \
+    make copy-obi-vendor
+
+# Step 2: Apply our C patches to .obi-src (after submodule clone)
+COPY .obi-src/bpf/common/common.h .obi-src/bpf/common/common.h
+COPY .obi-src/bpf/gotracer/go_nethttp.c .obi-src/bpf/gotracer/go_nethttp.c
+COPY .obi-src/bpf/gotracer/types/nethttp.h .obi-src/bpf/gotracer/types/nethttp.h
+
+# Step 3: Regenerate ONLY the affected eBPF programs with our C changes
+RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
     export BPF_CLANG=clang && \
     export BPF_CFLAGS="-std=gnu17 -O2 -g -Wall -Werror" && \
     export BPF2GO=/go/bin/bpf2go && \
-    echo "### Generating all eBPF files..." && \
-    go generate ./... && \
+    cd .obi-src && \
+    go generate ./pkg/ebpf/common/ && \
+    go generate ./pkg/internal/ebpf/gotracer/ && \
     cd /src && make copy-obi-vendor
 
-# Re-apply our Go patches after copy-obi-vendor overwrites vendor files
+# Step 4: Re-apply our Go patches after copy-obi-vendor
 COPY pkg/beyla/config_obi.go pkg/beyla/config_obi.go
 COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go
 COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/http_transform.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/http_transform.go
 COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/spanner.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/spanner.go
 
-# Compile with all patches applied
+# Step 5: Compile with all patches applied
 RUN make compile
 
 # Final minimal image
