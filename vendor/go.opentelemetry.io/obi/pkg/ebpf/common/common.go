@@ -352,8 +352,14 @@ func NewEBPFParseContext(cfg *config.EBPFTracer, spansChan *msg.Queue[[]request.
 	}
 
 	var httpEnricher *ebpfhttp.HTTPEnricher
+	ptlog().Info("HTTP enrichment config check",
+		"enrichment.enabled", payloadExtraction.HTTP.Enrichment.Enabled,
+		"enrichment.rules", len(payloadExtraction.HTTP.Enrichment.Rules),
+		"payload_extraction.enabled", payloadExtraction.Enabled(),
+	)
 	if payloadExtraction.HTTP.Enrichment.Enabled {
 		httpEnricher = ebpfhttp.NewHTTPEnricher(payloadExtraction.HTTP.Enrichment)
+		ptlog().Info("HTTP enrichment initialized", "rules", len(payloadExtraction.HTTP.Enrichment.Rules))
 	}
 
 	return &EBPFParseContext{
