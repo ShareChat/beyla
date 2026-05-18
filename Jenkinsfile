@@ -1,7 +1,7 @@
 pipeline {
   agent {
     kubernetes {
-      label 'beyla'
+      label 'beyla-custom'
       yaml """
 apiVersion: v1
 kind: Pod
@@ -57,10 +57,10 @@ spec:
 
 
   environment {
-    app="beyla"
+    app="beyla-custom"
     sc_regions="mumbai"
     buildarg_DEV_OBI="1"
-    buildarg_DEPLOYMENT_ID="beyla-$GIT_COMMIT"
+    buildarg_DEPLOYMENT_ID="beyla-custom-$GIT_COMMIT"
     buildarg_GITHUB_TOKEN=credentials('github-access')
   }
    stages{
