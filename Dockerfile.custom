@@ -1,6 +1,5 @@
 ARG GEN_IMG=ghcr.io/open-telemetry/obi-generator:0.2.13@sha256:d7b46e5d965d29cf524afd32a53822a2950a747ca8dcceef42e5c80cad9df021
 
-# Build the autoinstrumenter binary (skip Java agent build)
 FROM $GEN_IMG AS builder
 
 ARG TARGETARCH
@@ -10,7 +9,7 @@ WORKDIR /src
 
 RUN apk add make git bash
 
-# Copy the go manifests and source
+# Copy the go manifests and source (includes our patched files)
 COPY .git/ .git/
 COPY cmd/ cmd/
 COPY pkg/ pkg/
@@ -22,14 +21,22 @@ COPY LICENSE LICENSE
 COPY NOTICE NOTICE
 COPY third_party_licenses.csv third_party_licenses.csv
 
-# Point make to the pre-installed bpf2go binary in the generator image
 ENV BPF2GO=/go/bin/bpf2go
 
-# Skip make generate — we modified vendored code directly
-# Skip Java agent — not needed for Go/Node/generic auto-instrumentation
+# Generate eBPF objects (.o files) — this is required for compilation
+# copy-obi-vendor copies generated files to vendor/ (may overwrite our patches)
+RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
+    make generate && \
+    make copy-obi-vendor
+
+# Re-apply our patches after copy-obi-vendor overwrites vendor files
+COPY pkg/beyla/config_obi.go pkg/beyla/config_obi.go
+COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go
+
+# Compile with patches applied
 RUN make compile
 
-# Create final image from minimal + built binary
+# Final minimal image
 FROM scratch
 
 LABEL maintainer="ShareChat Hyperion <hyperion@sharechat.com>"
