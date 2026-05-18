@@ -59,7 +59,7 @@ spec:
   environment {
     app="beyla-custom"
     sc_regions="mumbai"
-    buildarg_DEV_OBI="1"
+    dockerfile="Dockerfile.custom"
     buildarg_DEPLOYMENT_ID="beyla-custom-$GIT_COMMIT"
     buildarg_GITHUB_TOKEN=credentials('github-access')
   }

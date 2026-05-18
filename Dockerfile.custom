@@ -1,0 +1,45 @@
+ARG GEN_IMG=ghcr.io/open-telemetry/obi-generator:0.2.13@sha256:d7b46e5d965d29cf524afd32a53822a2950a747ca8dcceef42e5c80cad9df021
+
+# Build the autoinstrumenter binary (skip Java agent build)
+FROM $GEN_IMG AS builder
+
+ARG TARGETARCH
+ENV GOARCH=$TARGETARCH
+
+WORKDIR /src
+
+RUN apk add make git bash
+
+# Copy the go manifests and source
+COPY .git/ .git/
+COPY cmd/ cmd/
+COPY pkg/ pkg/
+COPY vendor/ vendor/
+COPY go.mod go.mod
+COPY go.sum go.sum
+COPY Makefile Makefile
+COPY LICENSE LICENSE
+COPY NOTICE NOTICE
+COPY third_party_licenses.csv third_party_licenses.csv
+
+# Point make to the pre-installed bpf2go binary in the generator image
+ENV BPF2GO=/go/bin/bpf2go
+
+# Skip make generate — we modified vendored code directly
+# Skip Java agent — not needed for Go/Node/generic auto-instrumentation
+RUN make compile
+
+# Create final image from minimal + built binary
+FROM scratch
+
+LABEL maintainer="ShareChat Hyperion <hyperion@sharechat.com>"
+
+WORKDIR /
+
+COPY --from=builder /src/bin/beyla .
+COPY --from=builder /src/LICENSE .
+COPY --from=builder /src/NOTICE .
+COPY --from=builder /src/third_party_licenses.csv .
+COPY --from=builder /etc/ssl/certs /etc/ssl/certs
+
+ENTRYPOINT [ "/beyla" ]
