@@ -74,7 +74,7 @@ spec:
     stage('push') {
       when {
         anyOf {
-          branch 'testing'
+          branch 'feature/enrichment-fix'
         }
       }
       steps {
