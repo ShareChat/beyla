@@ -444,12 +444,25 @@ func ReadBPFTraceAsSpan(parseCtx *EBPFParseContext, cfg *config.EBPFTracer, reco
 	// The readMIMEHeader eBPF probe copies the first 256 bytes of HTTP headers
 	// into HeaderBuf. We parse them here and run the enricher to add custom
 	// headers (CF-RAY, X-Request-Id, etc.) as span attributes.
-	if parseCtx != nil && parseCtx.httpEnricher != nil && event.HeaderBufLen > 0 {
+	hasEnricher := parseCtx != nil && parseCtx.httpEnricher != nil
+	slog.Error("[HEADER_DEBUG] Go tracer event",
+		"path", span.Path,
+		"service", span.Host,
+		"hasEnricher", hasEnricher,
+		"headerBufLen", event.HeaderBufLen,
+		"headerBufFirst20", cstr(event.HeaderBuf[:min(20, len(event.HeaderBuf))]),
+		"recordSize", len(record.RawSample),
+		"expectedSize", unsafe.Sizeof(*event),
+	)
+	if hasEnricher && event.HeaderBufLen > 0 {
 		raw := cstr(event.HeaderBuf[:])
+		slog.Error("[HEADER_DEBUG] parsing headers", "rawLen", len(raw), "raw", raw[:min(100, len(raw))])
 		if len(raw) > 0 {
 			headers := extractHeadersFromRawBytes([]byte(raw))
+			slog.Error("[HEADER_DEBUG] parsed headers", "count", len(headers), "headers", headers)
 			if len(headers) > 0 {
 				parseCtx.httpEnricher.Enrich(&span, &http.Request{Header: headers}, &http.Response{Header: http.Header{}})
+				slog.Error("[HEADER_DEBUG] enriched span", "requestHeaders", span.RequestHeaders)
 			}
 		}
 	}
