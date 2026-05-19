@@ -36,6 +36,7 @@ COPY patches/bpf/gotracer/types/nethttp.h .obi-src/bpf/gotracer/types/nethttp.h
 COPY patches/bpf/gotracer/maps/nethttp.h .obi-src/bpf/gotracer/maps/nethttp.h
 
 # Step 3: Regenerate ONLY the affected eBPF programs with our C changes
+# Then copy ONLY the regenerated files (not full copy-obi-vendor which re-vendors all Go and breaks compatibility)
 RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
     export BPF_CLANG=clang && \
     export BPF_CFLAGS="-std=gnu17 -O2 -g -Wall -Werror" && \
@@ -43,7 +44,11 @@ RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
     cd .obi-src && \
     go generate ./pkg/ebpf/common/ && \
     go generate ./pkg/internal/ebpf/gotracer/ && \
-    cd /src && make copy-obi-vendor
+    cd /src && \
+    cp .obi-src/pkg/ebpf/common/bpf_*_bpfel.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/ && \
+    cp .obi-src/pkg/ebpf/common/bpf_*_bpfel.o vendor/go.opentelemetry.io/obi/pkg/ebpf/common/ && \
+    cp .obi-src/pkg/internal/ebpf/gotracer/bpf_*_bpfel.go vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/ && \
+    cp .obi-src/pkg/internal/ebpf/gotracer/bpf_*_bpfel.o vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/
 
 # Step 4: Re-apply our Go patches after copy-obi-vendor
 COPY pkg/beyla/config_obi.go pkg/beyla/config_obi.go
