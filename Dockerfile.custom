@@ -23,20 +23,19 @@ COPY third_party_licenses.csv third_party_licenses.csv
 
 ENV BPF2GO=/go/bin/bpf2go
 
-# Step 1: Normal generate — clones upstream OBI, compiles all eBPF objects
+# Step 1: Clone OBI submodule and compile all eBPF objects
+# Skip copy-obi-vendor (it runs go mod tidy/vendor which re-vendors all Go and breaks compatibility)
 RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
-    make generate && \
-    make copy-obi-vendor
+    make generate
 
 # Step 2: Apply our C patches to .obi-src (after submodule clone)
-# Patches are in the main repo (not the submodule) so they're committed and available in CI
 COPY patches/bpf/common/common.h .obi-src/bpf/common/common.h
 COPY patches/bpf/gotracer/go_nethttp.c .obi-src/bpf/gotracer/go_nethttp.c
 COPY patches/bpf/gotracer/types/nethttp.h .obi-src/bpf/gotracer/types/nethttp.h
 COPY patches/bpf/gotracer/maps/nethttp.h .obi-src/bpf/gotracer/maps/nethttp.h
 
 # Step 3: Regenerate ONLY the affected eBPF programs with our C changes
-# Then copy ONLY the regenerated files (not full copy-obi-vendor which re-vendors all Go and breaks compatibility)
+# Then copy ONLY the generated eBPF files to vendor (preserves original vendor Go code)
 RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
     export BPF_CLANG=clang && \
     export BPF_CFLAGS="-std=gnu17 -O2 -g -Wall -Werror" && \
