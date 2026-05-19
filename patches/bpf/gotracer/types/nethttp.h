@@ -37,10 +37,15 @@ typedef struct server_http_func_invocation {
     u8 pattern[k_pattern_max_len];
     u8 is_tls;
     u8 _pad[4];
-    u8 header_buf[k_header_buf_max_len];
-    u16 header_buf_len;
-    u8 _pad2[6];
 } server_http_func_invocation_t;
+
+// Separate structure for header buffer storage (too large for eBPF stack).
+// Stored in a BPF hash map keyed by goroutine address.
+typedef struct header_buf_entry {
+    u8 buf[k_header_buf_max_len];
+    u16 len;
+    u8 _pad[6];
+} header_buf_entry_t;
 
 typedef struct framer_func_invocation {
     u64 framer_ptr;

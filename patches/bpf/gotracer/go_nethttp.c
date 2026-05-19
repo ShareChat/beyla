@@ -450,15 +450,18 @@ int obi_uprobe_readMimeHeader(struct pt_regs *ctx) {
 
     bpf_dbg_printk("buf=%s", buf);
 
-    // Copy header buffer to invocation for enrichment in userspace
-    if (inv) {
+    // Store header buffer in BPF map for enrichment in userspace.
+    // Can't store in invocation struct (eBPF stack limit). Use separate map.
+    {
+        header_buf_entry_t hdr_entry = {};
         u16 copy_len = (u16)len;
         if (copy_len > k_header_buf_max_len) {
             copy_len = k_header_buf_max_len;
         }
         bpf_clamp_umax(copy_len, k_header_buf_max_len);
-        bpf_probe_read_kernel(inv->header_buf, copy_len, buf);
-        inv->header_buf_len = copy_len;
+        bpf_probe_read_kernel(hdr_entry.buf, copy_len, buf);
+        hdr_entry.len = copy_len;
+        bpf_map_update_elem(&go_header_buf_map, &g_key, &hdr_entry, BPF_ANY);
     }
 
     unsigned char *tp_ptr = bpf_strstr_tp_loop(buf, len);
@@ -592,10 +595,12 @@ static __always_inline int serve_http_returns(struct pt_regs *ctx) {
     trace->status = (u16)invocation->status;
     trace->response_length = invocation->response_length;
 
-    // Copy captured HTTP header buffer for enrichment in userspace
-    trace->header_buf_len = invocation->header_buf_len;
-    if (invocation->header_buf_len > 0) {
-        __builtin_memcpy(trace->header_buf, invocation->header_buf, k_header_buf_max_len);
+    // Copy captured HTTP header buffer from BPF map for enrichment in userspace
+    header_buf_entry_t *hdr_entry = bpf_map_lookup_elem(&go_header_buf_map, &g_key);
+    if (hdr_entry && hdr_entry->len > 0) {
+        __builtin_memcpy(trace->header_buf, hdr_entry->buf, k_header_buf_max_len);
+        trace->header_buf_len = hdr_entry->len;
+        bpf_map_delete_elem(&go_header_buf_map, &g_key);
     }
 
     make_tp_string(tp_buf, &invocation->tp);
