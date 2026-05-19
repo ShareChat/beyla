@@ -51,7 +51,7 @@ spec:
   }
 
   options {
-    timeout(time: 10, unit: 'MINUTES')
+    timeout(time: 30, unit: 'MINUTES')
     copyArtifactPermission('*')
   }
 
@@ -74,7 +74,7 @@ spec:
     stage('push') {
       when {
         anyOf {
-          branch 'feature/enrichment-fix'
+          branch 'feature/enrichment-v3.14.0'
         }
       }
       steps {
