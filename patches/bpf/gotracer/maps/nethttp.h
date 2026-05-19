@@ -66,6 +66,15 @@ struct {
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
 } framer_invocation_map SEC(".maps");
 
+// Per-CPU scratch space for building header_buf_entry_t without using eBPF stack
+// (header_buf_entry_t is too large for the 512-byte stack limit).
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, header_buf_entry_t);
+} header_buf_scratch SEC(".maps");
+
 // Stores captured HTTP header buffers per goroutine for enrichment.
 // Populated by readMIMEHeader probe, consumed by request completion probe.
 struct {

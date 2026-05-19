@@ -30,6 +30,7 @@ RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
 
 # Step 2: Apply our C patches to .obi-src (after submodule clone)
 COPY patches/bpf/common/common.h .obi-src/bpf/common/common.h
+COPY patches/bpf/common/globals.h .obi-src/bpf/common/globals.h
 COPY patches/bpf/gotracer/go_nethttp.c .obi-src/bpf/gotracer/go_nethttp.c
 COPY patches/bpf/gotracer/types/nethttp.h .obi-src/bpf/gotracer/types/nethttp.h
 COPY patches/bpf/gotracer/maps/nethttp.h .obi-src/bpf/gotracer/maps/nethttp.h

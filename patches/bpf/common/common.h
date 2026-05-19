@@ -71,7 +71,7 @@ enum : u64 {
 
 // k_header_buf_max_len is the max size of the raw HTTP header buffer captured
 // from Go's bufio.Reader during readMIMEHeader. Used for HTTP header enrichment.
-enum { k_header_buf_max_len = 256 };
+enum { k_header_buf_max_len = 1024 };
 
 // Trace of an HTTP call invocation. It is instantiated by the return uprobe and forwarded to the
 // user space through the events ringbuffer.

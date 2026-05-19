@@ -146,6 +146,16 @@ func (p *Tracer) constants() map[string]any {
 		m["high_request_volume"] = uint32(0)
 	}
 
+	// Header buffer capture size for enrichment (configurable, default 512, max 1024)
+	headerBufSize := uint32(p.cfg.HeaderBufCaptureSize)
+	if headerBufSize == 0 {
+		headerBufSize = 512
+	}
+	if headerBufSize > 1024 {
+		headerBufSize = 1024
+	}
+	m["g_header_buf_capture_size"] = headerBufSize
+
 	m["http_max_captured_bytes"] = p.cfg.BufferSizes.HTTP
 	m["mysql_max_captured_bytes"] = p.cfg.BufferSizes.MySQL
 	m["kafka_max_captured_bytes"] = p.cfg.BufferSizes.Kafka

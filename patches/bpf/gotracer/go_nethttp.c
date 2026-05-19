@@ -451,17 +451,25 @@ int obi_uprobe_readMimeHeader(struct pt_regs *ctx) {
     bpf_dbg_printk("buf=%s", buf);
 
     // Store header buffer in BPF map for enrichment in userspace.
-    // Can't store in invocation struct (eBPF stack limit). Use separate map.
+    // Use per-cpu scratch map (header_buf_entry_t is too large for eBPF stack).
     {
-        header_buf_entry_t hdr_entry = {};
-        u16 copy_len = (u16)len;
-        if (copy_len > k_header_buf_max_len) {
-            copy_len = k_header_buf_max_len;
+        u32 zero = 0;
+        header_buf_entry_t *hdr_entry = bpf_map_lookup_elem(&header_buf_scratch, &zero);
+        if (hdr_entry) {
+            __builtin_memset(hdr_entry, 0, sizeof(header_buf_entry_t));
+            u32 max_capture = g_header_buf_capture_size;
+            if (max_capture > k_header_buf_max_len) {
+                max_capture = k_header_buf_max_len;
+            }
+            u16 copy_len = (u16)len;
+            if (copy_len > max_capture) {
+                copy_len = (u16)max_capture;
+            }
+            bpf_clamp_umax(copy_len, k_header_buf_max_len);
+            bpf_probe_read_kernel(hdr_entry->buf, copy_len, buf);
+            hdr_entry->len = copy_len;
+            bpf_map_update_elem(&go_header_buf_map, &g_key, hdr_entry, BPF_ANY);
         }
-        bpf_clamp_umax(copy_len, k_header_buf_max_len);
-        bpf_probe_read_kernel(hdr_entry.buf, copy_len, buf);
-        hdr_entry.len = copy_len;
-        bpf_map_update_elem(&go_header_buf_map, &g_key, &hdr_entry, BPF_ANY);
     }
 
     unsigned char *tp_ptr = bpf_strstr_tp_loop(buf, len);

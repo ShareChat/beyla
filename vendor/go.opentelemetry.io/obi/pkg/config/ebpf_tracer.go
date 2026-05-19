@@ -121,6 +121,11 @@ type EBPFTracer struct {
 	// Configure data extraction/parsing based on protocol
 	PayloadExtraction PayloadExtraction `yaml:"payload_extraction"`
 
+	// HeaderBufCaptureSize controls how many bytes of HTTP headers are captured by the
+	// readMIMEHeader eBPF probe for header enrichment. Larger values capture more headers
+	// but use more memory per request. Max is 1024. Default is 512.
+	HeaderBufCaptureSize int `yaml:"header_buf_capture_size" env:"BEYLA_HEADER_BUF_CAPTURE_SIZE" validate:"gte=0,lte=1024"`
+
 	// Maximum time allowed for two requests to be correlated as parent -> child
 	// Some programs (e.g. load generators) keep on generating requests from the same thread in perpetuity,
 	// which can generate very large traces. We want to mark the parent trace as invalid if this happens.

@@ -147,6 +147,7 @@ var DefaultConfig = Config{
 		KafkaTopicUUIDCacheSize:             1024,
 		CouchbaseDBCacheSize:                1024,
 		OverrideBPFLoopEnabled:              false,
+		HeaderBufCaptureSize: 512, // default: capture first 512 bytes of HTTP headers
 		PayloadExtraction: config.PayloadExtraction{
 			HTTP: config.HTTPConfig{
 				GraphQL: config.GraphQLConfig{
