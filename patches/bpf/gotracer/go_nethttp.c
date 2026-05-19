@@ -456,7 +456,7 @@ int obi_uprobe_readMimeHeader(struct pt_regs *ctx) {
         u32 zero = 0;
         header_buf_entry_t *hdr_entry = bpf_map_lookup_elem(&header_buf_scratch, &zero);
         if (hdr_entry) {
-            __builtin_memset(hdr_entry, 0, sizeof(header_buf_entry_t));
+            hdr_entry->len = 0;
             u32 max_capture = g_header_buf_capture_size;
             if (max_capture > k_header_buf_max_len) {
                 max_capture = k_header_buf_max_len;
