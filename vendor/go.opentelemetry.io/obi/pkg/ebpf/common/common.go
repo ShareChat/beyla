@@ -353,14 +353,8 @@ func NewEBPFParseContext(cfg *config.EBPFTracer, spansChan *msg.Queue[[]request.
 	}
 
 	var httpEnricher *ebpfhttp.HTTPEnricher
-	ptlog().Info("HTTP enrichment config check",
-		"enrichment.enabled", payloadExtraction.HTTP.Enrichment.Enabled,
-		"enrichment.rules", len(payloadExtraction.HTTP.Enrichment.Rules),
-		"payload_extraction.enabled", payloadExtraction.Enabled(),
-	)
 	if payloadExtraction.HTTP.Enrichment.Enabled {
 		httpEnricher = ebpfhttp.NewHTTPEnricher(payloadExtraction.HTTP.Enrichment)
-		ptlog().Info("HTTP enrichment initialized", "rules", len(payloadExtraction.HTTP.Enrichment.Rules))
 	}
 
 	return &EBPFParseContext{
@@ -441,28 +435,12 @@ func ReadBPFTraceAsSpan(parseCtx *EBPFParseContext, cfg *config.EBPFTracer, reco
 	span := HTTPRequestTraceToSpan(event)
 
 	// Enrich Go tracer spans with HTTP headers from the captured header buffer.
-	// The readMIMEHeader eBPF probe copies the first 256 bytes of HTTP headers
-	// into HeaderBuf. We parse them here and run the enricher to add custom
-	// headers (CF-RAY, X-Request-Id, etc.) as span attributes.
-	hasEnricher := parseCtx != nil && parseCtx.httpEnricher != nil
-	slog.Error("[HEADER_DEBUG] Go tracer event",
-		"path", span.Path,
-		"service", span.Host,
-		"hasEnricher", hasEnricher,
-		"headerBufLen", event.HeaderBufLen,
-		"headerBufFirst20", cstr(event.HeaderBuf[:min(20, len(event.HeaderBuf))]),
-		"recordSize", len(record.RawSample),
-		"expectedSize", unsafe.Sizeof(*event),
-	)
-	if hasEnricher && event.HeaderBufLen > 0 {
+	// The readMIMEHeader eBPF probe copies headers into HeaderBuf.
+	if parseCtx != nil && parseCtx.httpEnricher != nil && event.HeaderBufLen > 0 {
 		raw := cstr(event.HeaderBuf[:])
-		slog.Error("[HEADER_DEBUG] parsing headers", "rawLen", len(raw), "raw", raw[:min(100, len(raw))])
 		if len(raw) > 0 {
-			headers := extractHeadersFromRawBytes([]byte(raw))
-			slog.Error("[HEADER_DEBUG] parsed headers", "count", len(headers), "headers", headers)
-			if len(headers) > 0 {
+			if headers := extractHeadersFromRawBytes([]byte(raw)); len(headers) > 0 {
 				parseCtx.httpEnricher.Enrich(&span, &http.Request{Header: headers}, &http.Response{Header: http.Header{}})
-				slog.Error("[HEADER_DEBUG] enriched span", "requestHeaders", span.RequestHeaders)
 			}
 		}
 	}
