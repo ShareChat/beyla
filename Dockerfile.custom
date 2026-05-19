@@ -29,9 +29,10 @@ RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
     make copy-obi-vendor
 
 # Step 2: Apply our C patches to .obi-src (after submodule clone)
-COPY .obi-src/bpf/common/common.h .obi-src/bpf/common/common.h
-COPY .obi-src/bpf/gotracer/go_nethttp.c .obi-src/bpf/gotracer/go_nethttp.c
-COPY .obi-src/bpf/gotracer/types/nethttp.h .obi-src/bpf/gotracer/types/nethttp.h
+# Patches are in the main repo (not the submodule) so they're committed and available in CI
+COPY patches/bpf/common/common.h .obi-src/bpf/common/common.h
+COPY patches/bpf/gotracer/go_nethttp.c .obi-src/bpf/gotracer/go_nethttp.c
+COPY patches/bpf/gotracer/types/nethttp.h .obi-src/bpf/gotracer/types/nethttp.h
 
 # Step 3: Regenerate ONLY the affected eBPF programs with our C changes
 RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
