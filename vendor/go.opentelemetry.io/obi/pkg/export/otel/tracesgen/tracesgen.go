@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"strconv"
 	"time"
@@ -370,6 +371,13 @@ func jsonRPCAttributes(span *request.Span) []attribute.KeyValue {
 
 // httpEnrichmentAttributes converts extracted HTTP headers and body content to OTel span attributes.
 func httpEnrichmentAttributes(span *request.Span) []attribute.KeyValue {
+	if len(span.RequestHeaders) > 0 {
+		slog.Error("[HEADER_DEBUG_EXPORT] enrichment attributes",
+			"path", span.Path,
+			"requestHeaders", span.RequestHeaders,
+			"spanType", span.Type,
+		)
+	}
 	attrs := make([]attribute.KeyValue, 0, len(span.RequestHeaders)+len(span.ResponseHeaders))
 	for name, values := range span.RequestHeaders {
 		attrs = append(attrs, attribute.StringSlice(attr.HTTPRequestHeaderKey(name), values))
