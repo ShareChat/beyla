@@ -1,6 +1,7 @@
 package beyla
 
 import (
+	"log/slog"
 	"os"
 	"regexp"
 	"strings"
@@ -43,6 +44,18 @@ func (c *Config) AsOBI() *obi.Config {
 			// ".Some.Missing.FieldInSrc": cfgutil.SkipConversion,
 		})
 		overrideOBI(c, obiCfg)
+
+		// Explicitly ensure PayloadExtraction config is propagated from Beyla Config to OBI Config.
+		// The cfgutil.Convert reflection-based copy may not always propagate deeply nested config
+		// fields correctly across the Beyla/OBI boundary.
+		obiCfg.EBPF.PayloadExtraction = c.EBPF.PayloadExtraction
+
+		slog.Info("PayloadExtraction config",
+			"enrichment.enabled", obiCfg.EBPF.PayloadExtraction.HTTP.Enrichment.Enabled,
+			"enrichment.rules", len(obiCfg.EBPF.PayloadExtraction.HTTP.Enrichment.Rules),
+			"payload_extraction.enabled", obiCfg.EBPF.PayloadExtraction.Enabled(),
+		)
+
 		c.obi = obiCfg
 	}
 	return c.obi

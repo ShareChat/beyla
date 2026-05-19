@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -352,8 +353,14 @@ func NewEBPFParseContext(cfg *config.EBPFTracer, spansChan *msg.Queue[[]request.
 	}
 
 	var httpEnricher *ebpfhttp.HTTPEnricher
+	ptlog().Info("HTTP enrichment config check",
+		"enrichment.enabled", payloadExtraction.HTTP.Enrichment.Enabled,
+		"enrichment.rules", len(payloadExtraction.HTTP.Enrichment.Rules),
+		"payload_extraction.enabled", payloadExtraction.Enabled(),
+	)
 	if payloadExtraction.HTTP.Enrichment.Enabled {
 		httpEnricher = ebpfhttp.NewHTTPEnricher(payloadExtraction.HTTP.Enrichment)
+		ptlog().Info("HTTP enrichment initialized", "rules", len(payloadExtraction.HTTP.Enrichment.Rules))
 	}
 
 	return &EBPFParseContext{
@@ -431,7 +438,23 @@ func ReadBPFTraceAsSpan(parseCtx *EBPFParseContext, cfg *config.EBPFTracer, reco
 		return request.Span{}, true, err
 	}
 
-	return HTTPRequestTraceToSpan(event), false, nil
+	span := HTTPRequestTraceToSpan(event)
+
+	// Enrich Go tracer spans with HTTP headers from the captured header buffer.
+	// The readMIMEHeader eBPF probe copies the first 256 bytes of HTTP headers
+	// into HeaderBuf. We parse them here and run the enricher to add custom
+	// headers (CF-RAY, X-Request-Id, etc.) as span attributes.
+	if parseCtx != nil && parseCtx.httpEnricher != nil && event.HeaderBufLen > 0 {
+		raw := cstr(event.HeaderBuf[:])
+		if len(raw) > 0 {
+			headers := extractHeadersFromRawBytes([]byte(raw))
+			if len(headers) > 0 {
+				parseCtx.httpEnricher.Enrich(&span, &http.Request{Header: headers}, &http.Response{Header: http.Header{}})
+			}
+		}
+	}
+
+	return span, false, nil
 }
 
 func ReinterpretCast[T any](b []byte) (*T, error) {
@@ -581,6 +604,59 @@ func cstr(chars []uint8) string {
 	}
 
 	return string(chars[:addrLen])
+}
+
+// extractHeadersFromRawBytes parses HTTP headers from a raw byte buffer
+// (captured from Go's bufio.Reader by the readMIMEHeader eBPF probe).
+// Handles truncated buffers gracefully by extracting whatever complete
+// header lines are available.
+func extractHeadersFromRawBytes(raw []byte) http.Header {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	headers := make(http.Header)
+
+	// Skip the request line (e.g. "GET /call HTTP/1.1\r\n") if present
+	if bytes.HasPrefix(raw, []byte("GET ")) || bytes.HasPrefix(raw, []byte("POST ")) ||
+		bytes.HasPrefix(raw, []byte("PUT ")) || bytes.HasPrefix(raw, []byte("DELETE ")) ||
+		bytes.HasPrefix(raw, []byte("HEAD ")) || bytes.HasPrefix(raw, []byte("PATCH ")) ||
+		bytes.HasPrefix(raw, []byte("OPTIONS ")) {
+		if idx := bytes.Index(raw, []byte("\r\n")); idx >= 0 {
+			raw = raw[idx+2:]
+		}
+	}
+
+	for len(raw) > 0 {
+		if len(raw) >= 2 && raw[0] == '\r' && raw[1] == '\n' {
+			break
+		}
+
+		lineEnd := bytes.Index(raw, []byte("\r\n"))
+		if lineEnd < 0 {
+			lineEnd = len(raw)
+		}
+
+		line := raw[:lineEnd]
+		if colonIdx := bytes.IndexByte(line, ':'); colonIdx > 0 {
+			name := strings.TrimSpace(string(line[:colonIdx]))
+			value := strings.TrimSpace(string(line[colonIdx+1:]))
+			if name != "" && value != "" {
+				headers.Add(name, value)
+			}
+		}
+
+		if lineEnd+2 <= len(raw) {
+			raw = raw[lineEnd+2:]
+		} else {
+			break
+		}
+	}
+
+	if len(headers) == 0 {
+		return nil
+	}
+	return headers
 }
 
 func (connInfo *BPFConnInfo) reqHostInfo() (source, target string) {

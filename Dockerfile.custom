@@ -1,0 +1,70 @@
+ARG GEN_IMG=ghcr.io/open-telemetry/obi-generator:0.2.13@sha256:d7b46e5d965d29cf524afd32a53822a2950a747ca8dcceef42e5c80cad9df021
+
+FROM $GEN_IMG AS builder
+
+ARG TARGETARCH
+ENV GOARCH=$TARGETARCH
+
+WORKDIR /src
+
+RUN apk add make git bash
+
+# Copy the go manifests and source
+COPY .git/ .git/
+COPY cmd/ cmd/
+COPY pkg/ pkg/
+COPY vendor/ vendor/
+COPY go.mod go.mod
+COPY go.sum go.sum
+COPY Makefile Makefile
+COPY LICENSE LICENSE
+COPY NOTICE NOTICE
+COPY third_party_licenses.csv third_party_licenses.csv
+
+ENV BPF2GO=/go/bin/bpf2go
+
+# Step 1: Normal generate — clones upstream OBI, compiles all eBPF objects
+RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
+    make generate && \
+    make copy-obi-vendor
+
+# Step 2: Apply our C patches to .obi-src (after submodule clone)
+# Patches are in the main repo (not the submodule) so they're committed and available in CI
+COPY patches/bpf/common/common.h .obi-src/bpf/common/common.h
+COPY patches/bpf/gotracer/go_nethttp.c .obi-src/bpf/gotracer/go_nethttp.c
+COPY patches/bpf/gotracer/types/nethttp.h .obi-src/bpf/gotracer/types/nethttp.h
+COPY patches/bpf/gotracer/maps/nethttp.h .obi-src/bpf/gotracer/maps/nethttp.h
+
+# Step 3: Regenerate ONLY the affected eBPF programs with our C changes
+RUN export PATH="/usr/lib/llvm20/bin:$PATH" && \
+    export BPF_CLANG=clang && \
+    export BPF_CFLAGS="-std=gnu17 -O2 -g -Wall -Werror" && \
+    export BPF2GO=/go/bin/bpf2go && \
+    cd .obi-src && \
+    go generate ./pkg/ebpf/common/ && \
+    go generate ./pkg/internal/ebpf/gotracer/ && \
+    cd /src && make copy-obi-vendor
+
+# Step 4: Re-apply our Go patches after copy-obi-vendor
+COPY pkg/beyla/config_obi.go pkg/beyla/config_obi.go
+COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/common.go
+COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/http_transform.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/http_transform.go
+COPY vendor/go.opentelemetry.io/obi/pkg/ebpf/common/spanner.go vendor/go.opentelemetry.io/obi/pkg/ebpf/common/spanner.go
+
+# Step 5: Compile with all patches applied
+RUN make compile
+
+# Final minimal image
+FROM scratch
+
+LABEL maintainer="ShareChat Hyperion <hyperion@sharechat.com>"
+
+WORKDIR /
+
+COPY --from=builder /src/bin/beyla .
+COPY --from=builder /src/LICENSE .
+COPY --from=builder /src/NOTICE .
+COPY --from=builder /src/third_party_licenses.csv .
+COPY --from=builder /etc/ssl/certs /etc/ssl/certs
+
+ENTRYPOINT [ "/beyla" ]
