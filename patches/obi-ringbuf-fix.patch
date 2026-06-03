@@ -7,7 +7,7 @@ index 7baf44b5..6f97a3b5 100644
  struct {
      __uint(type, BPF_MAP_TYPE_RINGBUF);
 -    __uint(max_entries, 1 << 20);
-+    __uint(max_entries, 1 << 23);
++    __uint(max_entries, 1 << 25);
      __uint(pinning, OBI_PIN_INTERNAL);
  } events SEC(".maps");
  
