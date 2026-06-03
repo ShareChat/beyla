@@ -1,5 +1,5 @@
 diff --git a/bpf/common/ringbuf.h b/bpf/common/ringbuf.h
-index 7baf44b5..6f97a3b5 100644
+index 7baf44b5..6bb72e6f 100644
 --- a/bpf/common/ringbuf.h
 +++ b/bpf/common/ringbuf.h
 @@ -18,10 +18,19 @@
@@ -23,14 +23,7 @@ index 7baf44b5..6f97a3b5 100644
  // To be Injected from the user space during the eBPF program load & initialization
  volatile const u32 wakeup_data_bytes;
  
-@@ -31,9 +40,18 @@ volatile const u32 wakeup_data_bytes;
- static __always_inline long get_flags() {
- 
-     if (!wakeup_data_bytes) {
--        return 0;
-+        return BPF_RB_FORCE_WAKEUP;
-     }
- 
+@@ -37,3 +46,12 @@ static __always_inline long get_flags() {
      const u64 sz = bpf_ringbuf_query(&events, BPF_RB_AVAIL_DATA);
      return sz >= wakeup_data_bytes ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
  }
