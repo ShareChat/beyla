@@ -64,6 +64,13 @@ spec:
     buildarg_GITHUB_TOKEN=credentials('github-access')
   }
    stages{
+    stage('init-submodule') {
+      steps {
+        container('builder') {
+          sh 'git submodule update --init .obi-src'
+        }
+      }
+    }
     stage('build') {
       steps {
         container('builder') {
