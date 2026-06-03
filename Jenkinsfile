@@ -67,7 +67,7 @@ spec:
     stage('init-submodule') {
       steps {
         container('builder') {
-          sh 'git submodule update --init .obi-src'
+          sh 'git config --global --add safe.directory "$WORKSPACE" && git submodule update --init .obi-src'
         }
       }
     }
