@@ -1,0 +1,84 @@
+diff --git a/pkg/ebpf/common/ringbuf.go b/pkg/ebpf/common/ringbuf.go
+index 81974881..0f1fdf12 100644
+--- a/pkg/ebpf/common/ringbuf.go
++++ b/pkg/ebpf/common/ringbuf.go
+@@ -70,6 +70,13 @@ type ringBufForwarder[T any] struct {
+ 	metrics imetrics.Reporter
+ 	// lastReadAtUnixNano is updated by the read loop and observed by the periodic flusher.
+ 	lastReadAtUnixNano atomic.Int64
++
++	// debug counters for pipeline visibility
++	totalRead    atomic.Int64
++	totalParsed  atomic.Int64
++	totalIgnored atomic.Int64
++	totalErrors  atomic.Int64
++	totalFlushed atomic.Int64
+ }
+ 
+ // AlreadyForwarded is used in the case when a second tracer tries to set up the
+@@ -184,6 +191,7 @@ func (rbf *ringBufForwarder[T]) readAndForwardInner(ctx context.Context, eventsR
+ 		go rbf.bgFlushOnTimeout(ctx, out)
+ 	}
+ 	go rbf.flushOnAvailableBytes(ctx, eventsReader)
++	go rbf.logPipelineStats(ctx)
+ 
+ 	rbf.items = make([]T, rbf.cfg.BatchLength)
+ 	rbf.itemsLen = 0
+@@ -243,6 +251,7 @@ func (rbf *ringBufForwarder[T]) fillAndDispatch(
+ 	freeIdx chan int,
+ 	workIdx chan<- int,
+ ) bool {
++	rbf.totalRead.Add(1)
+ 	if err := eventsReader.ReadInto(&records[i]); err != nil {
+ 		freeIdx <- i
+ 		switch {
+@@ -315,11 +324,15 @@ func (rbf *ringBufForwarder[T]) parserLoop(
+ 			item, ignore, err := rbf.parse(&records[i])
+ 			freeIdx <- i
+ 			if err != nil {
++				rbf.totalErrors.Add(1)
+ 				rbf.logger.Debug("error parsing ring buffer event", "error", err)
+ 				continue
+ 			}
+ 			if !ignore {
++				rbf.totalParsed.Add(1)
+ 				parsed = append(parsed, item)
++			} else {
++				rbf.totalIgnored.Add(1)
+ 			}
+ 		}
+ 
+@@ -344,6 +357,25 @@ func (rbf *ringBufForwarder[T]) parserLoop(
+ 	}
+ }
+ 
++func (rbf *ringBufForwarder[T]) logPipelineStats(ctx context.Context) {
++	ticker := time.NewTicker(30 * time.Second)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ticker.C:
++			rbf.logger.Info("ringbuf pipeline stats",
++				"read", rbf.totalRead.Load(),
++				"parsed", rbf.totalParsed.Load(),
++				"ignored", rbf.totalIgnored.Load(),
++				"errors", rbf.totalErrors.Load(),
++				"flushed", rbf.totalFlushed.Load(),
++			)
++		case <-ctx.Done():
++			return
++		}
++	}
++}
++
+ func (rbf *ringBufForwarder[T]) storeLastReadAt(t time.Time) {
+ 	rbf.lastReadAtUnixNano.Store(t.UnixNano())
+ }
+@@ -358,6 +390,7 @@ func (rbf *ringBufForwarder[T]) hasPendingReadIdleSince(now time.Time, interval
+ }
+ 
+ func (rbf *ringBufForwarder[T]) flushEvents(ctx context.Context, out *msg.Queue[[]T]) {
++	rbf.totalFlushed.Add(int64(rbf.itemsLen))
+ 	if rbf.metrics != nil {
+ 		rbf.metrics.TracerFlush(rbf.itemsLen)
+ 	}
