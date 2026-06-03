@@ -1,0 +1,226 @@
+diff --git a/bpf/common/ringbuf.h b/bpf/common/ringbuf.h
+index 7baf44b5..6f97a3b5 100644
+--- a/bpf/common/ringbuf.h
++++ b/bpf/common/ringbuf.h
+@@ -18,10 +18,19 @@
+ // we can share them later if we find is worth not including code per duplicate
+ struct {
+     __uint(type, BPF_MAP_TYPE_RINGBUF);
+-    __uint(max_entries, 1 << 20);
++    __uint(max_entries, 1 << 23);
+     __uint(pinning, OBI_PIN_INTERNAL);
+ } events SEC(".maps");
+ 
++// Per-CPU array to count ring buffer reserve failures (drops).
++// Key 0 = total drop count. Userspace reads this to expose as a metric.
++struct {
++    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
++    __uint(max_entries, 1);
++    __type(key, u32);
++    __type(value, u64);
++} ringbuf_drops SEC(".maps");
++
+ // To be Injected from the user space during the eBPF program load & initialization
+ volatile const u32 wakeup_data_bytes;
+ 
+@@ -31,9 +40,18 @@ volatile const u32 wakeup_data_bytes;
+ static __always_inline long get_flags() {
+ 
+     if (!wakeup_data_bytes) {
+-        return 0;
++        return BPF_RB_FORCE_WAKEUP;
+     }
+ 
+     const u64 sz = bpf_ringbuf_query(&events, BPF_RB_AVAIL_DATA);
+     return sz >= wakeup_data_bytes ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
+ }
++
++// Call this when bpf_ringbuf_reserve returns NULL to count dropped events.
++static __always_inline void record_ringbuf_drop() {
++    u32 key = 0;
++    u64 *count = bpf_map_lookup_elem(&ringbuf_drops, &key);
++    if (count) {
++        __sync_fetch_and_add(count, 1);
++    }
++}
+diff --git a/bpf/generictracer/dns.h b/bpf/generictracer/dns.h
+index 1bf9383f..f1cae68a 100644
+--- a/bpf/generictracer/dns.h
++++ b/bpf/generictracer/dns.h
+@@ -195,6 +195,8 @@ static __always_inline u8 handle_dns(struct __sk_buff *skb,
+             read_skb_bytes(skb, dns_off, req->buf, len);
+             bpf_d_printk("sending dns trace [%s]", __FUNCTION__);
+             bpf_ringbuf_submit(req, get_flags());
++        } else {
++            record_ringbuf_drop();
+         }
+ 
+         return 1;
+@@ -235,6 +237,8 @@ static __always_inline u8 handle_dns_buf(const unsigned char *buf,
+             bpf_probe_read(req->buf, sizeof(req->buf), buf);
+             bpf_d_printk("sending dns trace [%s]", __FUNCTION__);
+             bpf_ringbuf_submit(req, get_flags());
++        } else {
++            record_ringbuf_drop();
+         }
+ 
+         return 1;
+diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
+index a65e8b9f..9b488eaf 100644
+--- a/bpf/generictracer/protocol_http.h
++++ b/bpf/generictracer/protocol_http.h
+@@ -122,6 +122,7 @@ static __always_inline void finish_http(http_info_t *info, pid_connection_info_t
+             bpf_ringbuf_submit(trace, get_flags());
+         } else {
+             bpf_dbg_printk("failed to reserve space in the ringbuf");
++            record_ringbuf_drop();
+         }
+ 
+         // bpf_dbg_printk("Terminating trace for pid=%d", pid_from_pid_tgid(pid_tid));
+diff --git a/bpf/generictracer/protocol_http2.h b/bpf/generictracer/protocol_http2.h
+index 8c6eb8c8..5ec74d9d 100644
+--- a/bpf/generictracer/protocol_http2.h
++++ b/bpf/generictracer/protocol_http2.h
+@@ -286,6 +286,8 @@ http2_grpc_end(http2_conn_stream_t *stream, http2_grpc_request_t *prev_info, voi
+             bpf_probe_read(prev_info->ret_data, k_kprobes_http2_ret_buf_size, u_buf);
+             __builtin_memcpy(trace, prev_info, sizeof(http2_grpc_request_t));
+             bpf_ringbuf_submit(trace, get_flags());
++        } else {
++            record_ringbuf_drop();
+         }
+     }
+ 
+diff --git a/bpf/generictracer/protocol_tcp.h b/bpf/generictracer/protocol_tcp.h
+index 55168f1e..c40c8852 100644
+--- a/bpf/generictracer/protocol_tcp.h
++++ b/bpf/generictracer/protocol_tcp.h
+@@ -251,6 +251,8 @@ static __always_inline void failed_to_connect_event(pid_connection_info_t *pid_c
+ 
+         tcp_get_or_set_trace_info(req, pid_conn, lw_thread, 0, orig_dport);
+         bpf_ringbuf_submit(req, get_flags());
++    } else {
++        record_ringbuf_drop();
+     }
+ }
+ 
+@@ -377,6 +379,7 @@ static __always_inline void handle_unknown_tcp_connection(pid_connection_info_t
+                 bpf_ringbuf_submit(trace, get_flags());
+             } else {
+                 bpf_dbg_printk("failed to reserve space on the ringbuf");
++                record_ringbuf_drop();
+             }
+             cleanup_trace_info(existing, pid_conn);
+         }
+diff --git a/bpf/gotracer/go_grpc.c b/bpf/gotracer/go_grpc.c
+index 4772f3d7..844603d6 100644
+--- a/bpf/gotracer/go_grpc.c
++++ b/bpf/gotracer/go_grpc.c
+@@ -246,6 +246,7 @@ int obi_uprobe_server_handleStream_return(struct pt_regs *ctx) {
+     http_request_trace_t *trace = bpf_ringbuf_reserve(&events, sizeof(http_request_trace_t), 0);
+     if (!trace) {
+         bpf_dbg_printk("can't reserve space in the ringbuffer");
++        record_ringbuf_drop();
+         goto done;
+     }
+     task_pid(&trace->pid);
+@@ -433,6 +434,7 @@ static __always_inline int grpc_connect_done(struct pt_regs *ctx, void *err) {
+     http_request_trace_t *trace = bpf_ringbuf_reserve(&events, sizeof(http_request_trace_t), 0);
+     if (!trace) {
+         bpf_dbg_printk("can't reserve space in the ringbuffer");
++        record_ringbuf_drop();
+         goto done;
+     }
+ 
+diff --git a/bpf/gotracer/go_kafka_go.c b/bpf/gotracer/go_kafka_go.c
+index f9a46599..cfba2841 100644
+--- a/bpf/gotracer/go_kafka_go.c
++++ b/bpf/gotracer/go_kafka_go.c
+@@ -212,6 +212,8 @@ int obi_uprobe_protocol_roundtrip_ret(struct pt_regs *ctx) {
+                 __builtin_memcpy(&trace->tp, &(topic_ptr->tp), sizeof(tp_info_t));
+                 task_pid(&trace->pid);
+                 bpf_ringbuf_submit(trace, get_flags());
++            } else {
++                record_ringbuf_drop();
+             }
+         }
+         bpf_map_delete_elem(&ongoing_produce_messages, &m_key);
+@@ -309,6 +311,8 @@ int obi_uprobe_reader_read_ret(struct pt_regs *ctx) {
+                 trace->end_monotime_ns = bpf_ktime_get_ns();
+                 task_pid(&trace->pid);
+                 bpf_ringbuf_submit(trace, get_flags());
++            } else {
++                record_ringbuf_drop();
+             }
+         } else {
+             bpf_dbg_printk("Found request with no start time, ignoring...");
+diff --git a/bpf/gotracer/go_mongo.c b/bpf/gotracer/go_mongo.c
+index 6d298327..351735c4 100644
+--- a/bpf/gotracer/go_mongo.c
++++ b/bpf/gotracer/go_mongo.c
+@@ -219,6 +219,8 @@ int obi_uprobe_mongo_op_execute_ret(struct pt_regs *ctx) {
+             trace->end_monotime_ns = bpf_ktime_get_ns();
+             task_pid(&trace->pid);
+             bpf_ringbuf_submit(trace, get_flags());
++        } else {
++            record_ringbuf_drop();
+         }
+     }
+ 
+diff --git a/bpf/gotracer/go_nethttp.c b/bpf/gotracer/go_nethttp.c
+index d0d77b47..4f4f135f 100644
+--- a/bpf/gotracer/go_nethttp.c
++++ b/bpf/gotracer/go_nethttp.c
+@@ -536,6 +536,7 @@ static __always_inline int serve_http_returns(struct pt_regs *ctx) {
+     http_request_trace_t *trace = bpf_ringbuf_reserve(&events, sizeof(http_request_trace_t), 0);
+     if (!trace) {
+         bpf_dbg_printk("can't reserve space in the ringbuffer");
++        record_ringbuf_drop();
+         goto done;
+     }
+ 
+@@ -729,6 +730,7 @@ int obi_uprobe_roundTripReturn(struct pt_regs *ctx) {
+     http_request_trace_t *trace = bpf_ringbuf_reserve(&events, sizeof(http_request_trace_t), 0);
+     if (!trace) {
+         bpf_dbg_printk("can't reserve space in the ringbuffer");
++        record_ringbuf_drop();
+         goto done;
+     }
+ 
+diff --git a/bpf/gotracer/go_redis.c b/bpf/gotracer/go_redis.c
+index c6bdca19..e647cce7 100644
+--- a/bpf/gotracer/go_redis.c
++++ b/bpf/gotracer/go_redis.c
+@@ -83,6 +83,8 @@ int obi_uprobe_redis_process_ret(struct pt_regs *ctx) {
+             trace->end_monotime_ns = bpf_ktime_get_ns();
+             task_pid(&trace->pid);
+             bpf_ringbuf_submit(trace, get_flags());
++        } else {
++            record_ringbuf_drop();
+         }
+     }
+ 
+diff --git a/bpf/gotracer/go_sarama.c b/bpf/gotracer/go_sarama.c
+index 0830dbfe..b9215af1 100644
+--- a/bpf/gotracer/go_sarama.c
++++ b/bpf/gotracer/go_sarama.c
+@@ -160,6 +160,8 @@ int obi_uprobe_sarama_response_promise_handle(struct pt_regs *ctx) {
+                     __builtin_memcpy(trace, req, sizeof(kafka_client_req_t));
+                     task_pid(&trace->pid);
+                     bpf_ringbuf_submit(trace, get_flags());
++                } else {
++                    record_ringbuf_drop();
+                 }
+             }
+             bpf_map_delete_elem(&kafka_requests, &k_key);
+diff --git a/bpf/gotracer/go_sql.c b/bpf/gotracer/go_sql.c
+index 1b4bbbb5..ef40a5e6 100644
+--- a/bpf/gotracer/go_sql.c
++++ b/bpf/gotracer/go_sql.c
+@@ -343,6 +343,7 @@ static __always_inline int process_sql_return(void *goroutine_addr, u8 error, u8
+         bpf_ringbuf_submit(trace, get_flags());
+     } else {
+         bpf_dbg_printk("can't reserve space in the ringbuffer");
++        record_ringbuf_drop();
+     }
+     return 0;
+ }
