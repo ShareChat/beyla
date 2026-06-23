@@ -85,11 +85,18 @@ COPY patches/ patches/
 ENV BPF2GO=/go/bin/bpf2go
 
 # Build
+# The patch must land in the VENDORED OBI tree, because `make compile` builds with
+# `-mod vendor`. `copy-obi-vendor` re-vendors OBI, so applying only to .obi-src is
+# not enough — re-apply to vendor/ afterwards, then assert the marker is present.
 RUN if [ -z "${DEV_OBI}" ]; then \
     export PATH="/usr/lib/llvm20/bin:$PATH" && \
+    apk add --no-cache patch && \
     make generate && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0001-tphdr-traceparent-logging.patch ) && \
-    make copy-obi-vendor \
+    make copy-obi-vendor && \
+    echo "### Re-applying [TPHDR] patch to vendored OBI" && \
+    ( cd vendor/go.opentelemetry.io/obi && patch -p1 --forward --fuzz=3 < /src/patches/0001-tphdr-traceparent-logging.patch || true ) && \
+    grep -q "TPHDR" vendor/go.opentelemetry.io/obi/pkg/ebpf/common/spanner.go || (echo "FATAL: [TPHDR] patch missing from vendored OBI" && exit 1) \
     ; fi
 
 # The Java agent is embedded at Go compile time, so the platform-specific jar
