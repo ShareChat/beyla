@@ -75,14 +75,8 @@ spec:
           sh '''
             set -eu
             git config --global --add safe.directory '*'
-
-            # Pull the OBI submodule (.obi-src) at the pinned upstream commit,
-            # then apply the ShareChat patch (traceparent-extraction logging).
-            git submodule update --init --recursive
-            ( cd .obi-src && git apply --verbose ../patches/0001-tphdr-traceparent-logging.patch )
-
-            # Build via armory (platform-supported; handles registry auth + mirroring).
-            # Builds the self-contained upstream Dockerfile against the patched workspace.
+            # The traceparent patch is applied INSIDE the Dockerfile (after its own
+            # `make generate` submodule checkout) — a host-side apply is wiped by it.
             armory build
           '''
         }

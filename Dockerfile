@@ -77,6 +77,9 @@ COPY Makefile Makefile
 COPY LICENSE LICENSE
 COPY NOTICE NOTICE
 COPY third_party_licenses.csv third_party_licenses.csv
+# ShareChat: traceparent-extraction logging patch, applied to .obi-src inside the
+# build (make generate re-inits the submodule, so a host-side apply would be lost).
+COPY patches/ patches/
 
 # Point make to the pre-installed bpf2go binary in the generator image
 ENV BPF2GO=/go/bin/bpf2go
@@ -85,6 +88,7 @@ ENV BPF2GO=/go/bin/bpf2go
 RUN if [ -z "${DEV_OBI}" ]; then \
     export PATH="/usr/lib/llvm20/bin:$PATH" && \
     make generate && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0001-tphdr-traceparent-logging.patch ) && \
     make copy-obi-vendor \
     ; fi
 
