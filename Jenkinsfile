@@ -71,7 +71,7 @@ spec:
       steps {
         container('builder') {
           sh '''
-            set -euo pipefail
+            set -eu
             git config --global --add safe.directory '*'
 
             # Pull the OBI submodule (.obi-src) at the pinned upstream commit,
@@ -98,7 +98,7 @@ spec:
       steps {
         container('builder') {
           sh '''
-            set -euo pipefail
+            set -eu
             docker push ${REGISTRY}/${IMAGE}:${IMAGE_TAG}
           '''
         }
