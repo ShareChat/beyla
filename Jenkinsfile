@@ -75,8 +75,11 @@ spec:
           sh '''
             set -eu
             git config --global --add safe.directory '*'
-            # The traceparent patch is applied INSIDE the Dockerfile (after its own
-            # `make generate` submodule checkout) — a host-side apply is wiped by it.
+            # .obi-src must be populated in the build context for the Dockerfile's
+            # jni/javaagent COPY stages. The traceparent patch itself is applied
+            # INSIDE the Dockerfile (after its own make-generate submodule checkout),
+            # so we do NOT git apply on the host here.
+            git submodule update --init --recursive
             armory build
           '''
         }
