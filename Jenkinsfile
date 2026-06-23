@@ -55,9 +55,11 @@ spec:
   }
 
   environment {
-    REGISTRY  = "sc-mum-armory.platform.internal"
-    IMAGE     = "sharechat/beyla-custom"
-    IMAGE_TAG = "v3.22.2-tphdr-debug"
+    sc_regions = "mumbai"
+    app        = "beyla-custom"
+    imagetags  = "v3.22.2-tphdr-debug"
+    buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
+    buildarg_BUILDARCH     = "amd64"
   }
 
   stages {
@@ -79,10 +81,9 @@ spec:
             git submodule update --init --recursive
             ( cd .obi-src && git apply --verbose ../patches/0001-tphdr-traceparent-logging.patch )
 
-            # Build the self-contained upstream Dockerfile (handles eBPF generation
-            # via the obi-generator stage + compiles the patched .obi-src).
-            docker build --build-arg BUILDARCH=amd64 \
-              -t ${REGISTRY}/${IMAGE}:${IMAGE_TAG} .
+            # Build via armory (platform-supported; handles registry auth + mirroring).
+            # Builds the self-contained upstream Dockerfile against the patched workspace.
+            armory build
           '''
         }
       }
@@ -99,7 +100,7 @@ spec:
         container('builder') {
           sh '''
             set -eu
-            docker push ${REGISTRY}/${IMAGE}:${IMAGE_TAG}
+            armory push
           '''
         }
       }
