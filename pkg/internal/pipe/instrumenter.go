@@ -34,7 +34,9 @@ func Build(ctx context.Context, config *beyla.Config, ctxInfo *global.ContextInf
 	// 2. the process metrics swarm pipeline, connected to the output of (1)
 	swi := &swarm.Instancer{}
 	swi.Add(func(ctx context.Context) (swarm.RunFunc, error) {
-		obiSwarm, err := appolly.Build(ctx, config.AsOBI(), ctxInfo, tracesCh, processEventsCh)
+		// OBI 3.24 added a caller-owned runtimeMetrics queue; nil = runtime metrics
+		// disabled, matching Beyla's prior behavior (the 3.22 API had no such param).
+		obiSwarm, err := appolly.Build(ctx, config.AsOBI(), ctxInfo, tracesCh, processEventsCh, nil)
 		if err != nil {
 			return nil, fmt.Errorf("instantiating OBI app pipeline: %w", err)
 		}
