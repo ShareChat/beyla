@@ -102,7 +102,9 @@ ENV BPF2GO=/go/bin/bpf2go
 #      tree into vendor/ (go.mod: `replace go.opentelemetry.io/obi => ./.obi-src`).
 # Assertions fail the build if the loader wiring or the regenerated program is absent.
 RUN if [ -z "${DEV_OBI}" ]; then \
-    export PATH="/usr/lib/llvm20/bin:$PATH" && \
+    export PATH="/usr/lib/llvm22/bin:$PATH" && \
+    export BPF_CLANG=clang-22 && \
+    export BPF_CFLAGS="-O2 -g -Wall -Werror" && \
     make generate && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0004-large-header-traceparent-scan-v324.patch ) && \
     ( cd .obi-src && make generate ) && \
