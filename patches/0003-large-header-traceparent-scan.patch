@@ -153,10 +153,10 @@ index 94f974b0..214f2235 100644
          } else {
              bpf_dbg_printk("identified SSL connection, ignoring: [%llx]...", *ssl);
 diff --git a/bpf/generictracer/k_tracer_defs.h b/bpf/generictracer/k_tracer_defs.h
-index 15b7b9f3..ce16e267 100644
+index b7ee3064..159bdaf6 100644
 --- a/bpf/generictracer/k_tracer_defs.h
 +++ b/bpf/generictracer/k_tracer_defs.h
-@@ -56,6 +56,10 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
+@@ -60,6 +60,10 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
      args->u_buf = (u64)u_buf;
      args->lw_thread = lw_thread;
      args->protocols = protocols;
@@ -167,7 +167,7 @@ index 15b7b9f3..ce16e267 100644
      args->protocol_type = protocol_type_for_conn_info(info);
  
      args->pid_conn = *info;
-@@ -64,13 +68,16 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
+@@ -71,13 +75,16 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
      return args;
  }
  
@@ -191,7 +191,7 @@ index 15b7b9f3..ce16e267 100644
      call_protocol_args_t *args = make_protocol_args(pid_conn,
                                                      k_lw_thread_none,
                                                      k_protocol_selector_all,
-@@ -83,9 +90,34 @@ static __always_inline void handle_buf_with_connection(void *ctx,
+@@ -90,9 +97,34 @@ static __always_inline void handle_buf_with_connection(void *ctx,
          return;
      }
  
@@ -226,7 +226,7 @@ index 15b7b9f3..ce16e267 100644
  static __always_inline void handle_light_weight_thread_buf(void *ctx,
                                                             const lw_thread_t lw_thread,
                                                             protocol_selector_t protocols,
-@@ -101,6 +133,7 @@ static __always_inline void handle_light_weight_thread_buf(void *ctx,
+@@ -108,6 +140,7 @@ static __always_inline void handle_light_weight_thread_buf(void *ctx,
          return;
      }
  
@@ -288,12 +288,17 @@ index a0979c49..9aafffcd 100644
          } else if (args->protocols.tcp && !info) {
              // SSL requests will see both TCP traffic and text traffic, ignore the TCP if
 diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
-index a65e8b9f..6c658009 100644
+index 05355f3f..60ada292 100644
 --- a/bpf/generictracer/protocol_http.h
 +++ b/bpf/generictracer/protocol_http.h
-@@ -37,6 +37,16 @@
+@@ -38,8 +38,21 @@
  
  volatile const u32 high_request_volume;
+ 
++// ShareChat: keep the stale-traceparent scratch buffer (mega-trace fix from the
++// 3.22 base) AND add the chunked-scan tail-call budgets below — both are needed,
++// so the upstream merge keeps both sides.
+ SCRATCH_MEM_SIZED(http_previous_trace_id, TRACE_ID_SIZE_BYTES);
  
 +// Tail-call budgets (BPF_MAX_TAIL_CALL_CNT = 32 on kernels 5.8–5.9):
 +//   prog 13 (non-append): 3 preceding TCs + 28 self-TCs (niter=1..28) = 31
@@ -308,7 +313,7 @@ index a65e8b9f..6c658009 100644
  // empty_http_info zeroes and return the unique percpu copy in the map
  // this function assumes that a given thread is not trying to use many
  // instances at the same time
-@@ -445,6 +455,221 @@ int obi_continue2_protocol_http(struct pt_regs *ctx) {
+@@ -448,6 +461,221 @@ int obi_continue2_protocol_http(struct pt_regs *ctx) {
      return __obi_continue2_protocol_http(ctx, args, info, meta);
  }
  
@@ -530,7 +535,7 @@ index a65e8b9f..6c658009 100644
  static __always_inline int
  __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                                  call_protocol_args_t *args,
-@@ -482,6 +707,7 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
+@@ -485,6 +713,7 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
  
          unsigned char *buf = (unsigned char *)tp_char_buf_mem();
          if (buf) {
@@ -538,7 +543,7 @@ index a65e8b9f..6c658009 100644
              u16 buf_len = args->bytes_len;
              bpf_clamp_umax(buf_len, TRACE_BUF_SIZE - 1);
  
-@@ -509,6 +735,15 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
+@@ -525,6 +754,15 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                  }
              } else {
                  bpf_dbg_printk("No additional traceparent in headers, using what was made before");
@@ -554,7 +559,7 @@ index a65e8b9f..6c658009 100644
              }
          } else {
              goto done;
-@@ -764,15 +999,23 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
+@@ -780,15 +1018,23 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
          handle_http_response(
              args->small_buf, &args->pid_conn, info, args->bytes_len, args->lw_thread);
      } else if (still_reading(info)) {
@@ -817,7 +822,7 @@ index 2394cdb5..7927c0e3 100644
  }
  
 diff --git a/pkg/internal/ebpf/gotracer/gotracer.go b/pkg/internal/ebpf/gotracer/gotracer.go
-index ffbed77a..56737497 100644
+index 14e732a4..274b5061 100644
 --- a/pkg/internal/ebpf/gotracer/gotracer.go
 +++ b/pkg/internal/ebpf/gotracer/gotracer.go
 @@ -152,6 +152,14 @@ func (p *Tracer) constants() map[string]any {
@@ -845,7 +850,7 @@ index ffbed77a..56737497 100644
  	} {
  		p.log.Debug("loading program into tail call jump table", "index", i, "program", prog.String())
  		if err := p.bpfObjects.JumpTable.Update(uint32(i), uint32(prog.FD()), ebpf.UpdateAny); err != nil {
-@@ -664,9 +675,9 @@ func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
+@@ -665,9 +676,9 @@ func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
  		}},
  	}
  
@@ -858,7 +863,7 @@ index ffbed77a..56737497 100644
  	if p.supportsBPFLoop {
  		m["net/textproto.readMIMEHeader"] = []*ebpfcommon.ProbeDesc{{
  			Start: p.bpfObjects.ObiUprobeReadMimeHeader,
-@@ -675,7 +686,18 @@ func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
+@@ -676,7 +687,18 @@ func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
  		m["net/textproto.(*Reader).ReadMIMEHeader"] = []*ebpfcommon.ProbeDesc{{
  			Start: p.bpfObjects.ObiUprobeReadMimeHeader,
  		}}

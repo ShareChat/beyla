@@ -1,8 +1,7 @@
-// Custom Beyla image build (ShareChat) — backports upstream OBI PR #1988
-// (configurable large-header traceparent scan, OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB)
-// on top of Beyla release-3.20 (.obi-src pinned to dd2d305a / v3.20.0).
-// Ref: https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/pull/1988
-//      https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/issues/1381
+// Custom Beyla image build (ShareChat) — adds a configurable large-header
+// traceparent scan window (OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB) on top of
+// the Beyla 3.22 base (.obi-src pinned to release-3.22.1 / 70fcb25e), which keeps
+// the stale-traceparent / mega-trace fixes that the 3.20 line lacked.
 //
 // The code change lives as a patch in patches/ (the .obi-src submodule points at
 // grafana upstream and is not pushable), applied to .obi-src at build time BEFORE
@@ -60,7 +59,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "v3.20.0-tp1988-largehdr"
+    imagetags  = "custom-beyla-v3.22.2"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }

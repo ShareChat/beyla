@@ -77,19 +77,19 @@ COPY Makefile Makefile
 COPY LICENSE LICENSE
 COPY NOTICE NOTICE
 COPY third_party_licenses.csv third_party_licenses.csv
-# ShareChat: OBI PR#1988 backport patch, applied to .obi-src inside the build.
-# The builder does not COPY .obi-src; `make generate` re-creates it from the copied
-# .git/ submodule, so the patch must be applied AFTER that and BEFORE bindings are
+# ShareChat: large-header traceparent-scan backport patch, applied to .obi-src inside
+# the build. The builder does not COPY .obi-src; `make generate` re-creates it from the
+# copied .git/ submodule, so the patch must be applied AFTER that and BEFORE bindings are
 # (re)generated from the patched eBPF C.
 COPY patches/ patches/
 
 # Point make to the pre-installed bpf2go binary in the generator image
 ENV BPF2GO=/go/bin/bpf2go
 
-# Build — ShareChat backport of OBI PR #1988 (configurable large-header traceparent
-# scan, OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB). The patch changes eBPF C (new
-# split tail-call programs + a new volatile-const global), so the bpf2go bindings
-# MUST be regenerated from the patched C. Sequence:
+# Build — ShareChat large-header traceparent-scan backport (adds the configurable
+# OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB chunked scanner) on top of the 3.22 base.
+# The patch changes eBPF C (new split tail-call programs + a new volatile-const global),
+# so the bpf2go bindings MUST be regenerated from the patched C. Sequence:
 #   1. `make generate` — re-creates .obi-src from .git (obi-submodule) and runs the
 #      initial generation, so .obi-src + toolchain are present.
 #   2. apply the backport patch to the now-present .obi-src.
@@ -102,11 +102,11 @@ ENV BPF2GO=/go/bin/bpf2go
 RUN if [ -z "${DEV_OBI}" ]; then \
     export PATH="/usr/lib/llvm20/bin:$PATH" && \
     make generate && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0002-backport-pr1988-large-header-traceparent.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0003-large-header-traceparent-scan.patch ) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
-    echo "### Asserting PR#1988 backport landed in vendored OBI" && \
-    grep -q "bpf_max_request_tp_parse_size_kb" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: PR#1988 loader wiring missing from vendored OBI" && exit 1) && \
+    echo "### Asserting large-header traceparent backport landed in vendored OBI" && \
+    grep -q "bpf_max_request_tp_parse_size_kb" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: loader wiring missing from vendored OBI" && exit 1) && \
     grep -rq "ObiParseTraceparentHttpAppend" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/ || (echo "FATAL: regenerated bindings missing new program — 'make generate' did not run on patched C" && exit 1) \
     ; fi
 
