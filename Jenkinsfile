@@ -1,10 +1,13 @@
-// Custom Beyla image build (ShareChat) — adds [TPHDR] traceparent-extraction
-// logging on top of upstream Beyla v3.22.2 (OBI v3.20.0).
+// Custom Beyla image build (ShareChat) — backports upstream OBI PR #1988
+// (configurable large-header traceparent scan, OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB)
+// on top of Beyla release-3.20 (.obi-src pinned to dd2d305a / v3.20.0).
+// Ref: https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/pull/1988
+//      https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/issues/1381
 //
 // The code change lives as a patch in patches/ (the .obi-src submodule points at
-// grafana upstream and is not pushable), applied to .obi-src at build time. The
-// repo Dockerfile is self-contained (multi-stage: obi-generator -> go build), so
-// a plain `docker build` regenerates eBPF and compiles the patched Go.
+// grafana upstream and is not pushable), applied to .obi-src at build time BEFORE
+// `make generate` so the bpf2go bindings regenerate from the patched eBPF C. The
+// repo Dockerfile is self-contained (multi-stage: obi-generator -> go build).
 pipeline {
   agent {
     kubernetes {
@@ -57,7 +60,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "v3.22.2-tphdr-debug"
+    imagetags  = "v3.20.0-tp1988-largehdr"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }

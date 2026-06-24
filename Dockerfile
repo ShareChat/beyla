@@ -85,18 +85,21 @@ COPY patches/ patches/
 ENV BPF2GO=/go/bin/bpf2go
 
 # Build
-# The patch must land in the VENDORED OBI tree, because `make compile` builds with
-# `-mod vendor`. `copy-obi-vendor` re-vendors OBI, so applying only to .obi-src is
-# not enough — re-apply to vendor/ afterwards, then assert the marker is present.
+# ShareChat backport of OBI PR #1988 (configurable large-header traceparent scan,
+# OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB). The patch changes eBPF C (new split
+# tail-call programs + a new volatile-const global), so it MUST be applied to
+# .obi-src BEFORE `make generate` — which runs `cd .obi-src && make generate` and
+# regenerates the bpf2go bindings from the patched C. `copy-obi-vendor` then vendors
+# the patched + regenerated tree (go.mod: `replace go.opentelemetry.io/obi => ./.obi-src`),
+# and `make compile` builds with `-mod vendor`.
 RUN if [ -z "${DEV_OBI}" ]; then \
     export PATH="/usr/lib/llvm20/bin:$PATH" && \
-    apk add --no-cache patch && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0002-backport-pr1988-large-header-traceparent.patch ) && \
     make generate && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0001-tphdr-traceparent-logging.patch ) && \
     make copy-obi-vendor && \
-    echo "### Re-applying [TPHDR] patch to vendored OBI" && \
-    ( cd vendor/go.opentelemetry.io/obi && patch -p1 --forward --fuzz=3 < /src/patches/0001-tphdr-traceparent-logging.patch || true ) && \
-    grep -q "TPHDR" vendor/go.opentelemetry.io/obi/pkg/ebpf/common/spanner.go || (echo "FATAL: [TPHDR] patch missing from vendored OBI" && exit 1) \
+    echo "### Asserting PR#1988 backport landed in vendored OBI" && \
+    grep -q "bpf_max_request_tp_parse_size_kb" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: PR#1988 loader wiring missing from vendored OBI" && exit 1) && \
+    grep -rq "ObiParseTraceparentHttpAppend" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/ || (echo "FATAL: regenerated bindings missing new program — 'make generate' did not run on patched C" && exit 1) \
     ; fi
 
 # The Java agent is embedded at Go compile time, so the platform-specific jar
