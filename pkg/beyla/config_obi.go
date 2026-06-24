@@ -41,6 +41,10 @@ func (c *Config) AsOBI() *obi.Config {
 			// or, renamed. For example:
 			// ".Some.Renamed.FieldInDst": "NameInSrc",
 			// ".Some.Missing.FieldInSrc": cfgutil.SkipConversion,
+
+			// OBI 3.24 added JVMRuntimeMetrics to obi.Config; Beyla's Config has no
+			// counterpart, so skip it (leaves OBI's default = disabled).
+			".JVMRuntimeMetrics": cfgutil.SkipConversion,
 		})
 		overrideOBI(c, obiCfg)
 		c.obi = obiCfg
