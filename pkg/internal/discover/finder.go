@@ -35,7 +35,7 @@ func NewProcessFinder(
 	return &ProcessFinder{
 		cfg: cfg, ctxInfo: ctxInfo,
 		ebpfEventContext: ebpfEventContext,
-		obiProcessFinder: obiDiscover.NewProcessFinder(cfg.AsOBI(), ctxInfo, tracesInput, ebpfEventContext),
+		obiProcessFinder: obiDiscover.NewProcessFinder(cfg.AsOBI(), ctxInfo, tracesInput, nil, ebpfEventContext),
 	}
 }
 
