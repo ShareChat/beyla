@@ -87,7 +87,8 @@ COPY patches/ patches/
 ENV BPF2GO=/go/bin/bpf2go
 
 # Build — ShareChat large-header traceparent-scan backport (adds the configurable
-# OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB chunked scanner) on top of the 3.22 base.
+# OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB chunked scanner) on top of the 3.24 base
+# (which also carries the readMimeHeader stale-bytes mega-trace fix).
 # The patch changes eBPF C (new split tail-call programs + a new volatile-const global),
 # so the bpf2go bindings MUST be regenerated from the patched C. Sequence:
 #   1. `make generate` — re-creates .obi-src from .git (obi-submodule) and runs the
@@ -102,7 +103,7 @@ ENV BPF2GO=/go/bin/bpf2go
 RUN if [ -z "${DEV_OBI}" ]; then \
     export PATH="/usr/lib/llvm20/bin:$PATH" && \
     make generate && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0003-large-header-traceparent-scan.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0004-large-header-traceparent-scan-v324.patch ) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
     echo "### Asserting large-header traceparent backport landed in vendored OBI" && \

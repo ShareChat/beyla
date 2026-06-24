@@ -1,7 +1,8 @@
 // Custom Beyla image build (ShareChat) — adds a configurable large-header
 // traceparent scan window (OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB) on top of
-// the Beyla 3.22 base (.obi-src pinned to release-3.22.1 / 70fcb25e), which keeps
-// the stale-traceparent / mega-trace fixes that the 3.20 line lacked.
+// the Beyla 3.24 base (.obi-src pinned to v3.24.0 / 54f2f639), which carries BOTH
+// mega-trace fixes the 3.22 line lacked: the connection/Kafka stale-parent fix AND
+// the readMimeHeader stale-bytes fix.
 //
 // The code change lives as a patch in patches/ (the .obi-src submodule points at
 // grafana upstream and is not pushable), applied to .obi-src at build time BEFORE
@@ -59,7 +60,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "custom-beyla-v3.22.2"
+    imagetags  = "custom-beyla-v3.24.0"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }
