@@ -1,4 +1,5 @@
-ARG GEN_IMG=ghcr.io/open-telemetry/obi-generator:0.2.13@sha256:d7b46e5d965d29cf524afd32a53822a2950a747ca8dcceef42e5c80cad9df021
+# obi-generator must match the .obi-src base: v3.24.0 requires 0.2.15 (3.20/3.22 used 0.2.13/0.2.14).
+ARG GEN_IMG=ghcr.io/open-telemetry/obi-generator:0.2.15
 
 # Build JNI native library using Go image (has gcc + apt; installs cross-compiler)
 FROM golang:1.26.3@sha256:313faae491b410a35402c05d35e7518ae99103d957308e940e1ae2cfa0aac29b AS jni-builder
