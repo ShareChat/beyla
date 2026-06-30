@@ -107,11 +107,15 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     export BPF_CFLAGS="-O2 -g -Wall -Werror" && \
     make generate && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0004-large-header-traceparent-scan-v324.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0005-tp-reuse-breaker.patch ) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
     echo "### Asserting large-header traceparent backport landed in vendored OBI" && \
     grep -q "bpf_max_request_tp_parse_size_kb" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: loader wiring missing from vendored OBI" && exit 1) && \
-    grep -rq "ObiParseTraceparentHttpAppend" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/ || (echo "FATAL: regenerated bindings missing new program — 'make generate' did not run on patched C" && exit 1) \
+    grep -rq "ObiParseTraceparentHttpAppend" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/ || (echo "FATAL: regenerated bindings missing new program — 'make generate' did not run on patched C" && exit 1) && \
+    echo "### Asserting tp-reuse-breaker landed in vendored OBI" && \
+    grep -q "tp_reuse_threshold" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/generictracer.go || (echo "FATAL: tp-reuse-breaker wiring missing from vendored OBI" && exit 1) && \
+    grep -rq "tp_reuse_count" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/ || (echo "FATAL: tp_reuse_count map missing from regenerated bindings" && exit 1) \
     ; fi
 
 # The Java agent is embedded at Go compile time, so the platform-specific jar
