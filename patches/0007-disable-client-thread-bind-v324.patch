@@ -1,0 +1,104 @@
+diff --git a/bpf/common/trace_parent.h b/bpf/common/trace_parent.h
+index 8f0df8e9..c41b2319 100644
+--- a/bpf/common/trace_parent.h
++++ b/bpf/common/trace_parent.h
+@@ -319,6 +319,17 @@ static __always_inline tp_info_pid_t *find_parent_trace(const pid_connection_inf
+         return java_parent;
+     }
+ 
++    // Generic thread/process-bound client parenting. For single-threaded
++    // runtimes (e.g. Node.js with runtime instrumentation disabled) many
++    // multiplexed client streams share one carrier tid and would all adopt the
++    // same server trace here, merging unrelated requests into one unbounded
++    // trace. When disable_client_thread_bind is set we skip this fallback so
++    // such client calls start their own trace. Language-specific parenting
++    // (Go/Python/nginx/puma/Java) above is unaffected.
++    if (disable_client_thread_bind) {
++        return 0;
++    }
++
+     tp_info_pid_t *proc_parent = find_parent_process_trace(t_key);
+ 
+     if (proc_parent) {
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index 2469735f..006c22c3 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -15,6 +15,16 @@
+ 
+ volatile const u32 disable_black_box_cp;
+ 
++// When set, disables the thread/process-bound fallback for parenting *client*
++// requests (find_parent_process_trace and the cp_support connection fallback).
++// Single-threaded runtimes (e.g. Node.js with runtime instrumentation disabled)
++// multiplex many unrelated requests onto one carrier tid; without per-request
++// context those client streams all adopt the same server trace, merging into an
++// unbounded "mega-trace". Disabling the thread bind makes such client calls
++// start their own trace instead. Language-agnostic; safe when no thread-per-
++// request native runtime relies on the generic process fallback.
++volatile const u32 disable_client_thread_bind;
++
+ #define TRACE_TYPE_SERVER 1
+ #define TRACE_TYPE_CLIENT 2
+ 
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index bcf631dc..dc4c36ab 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -91,6 +91,13 @@ type EBPFTracer struct {
+ 	// Disables OBI black-box context propagation. Used for testing purposes only.
+ 	DisableBlackBoxCP bool `yaml:"disable_black_box_cp" env:"OTEL_EBPF_BPF_DISABLE_BLACK_BOX_CP" validate:"boolean"`
+ 
++	// Disables the thread/process-bound fallback for parenting client requests.
++	// Prevents single-threaded runtimes (e.g. Node.js with runtime instrumentation
++	// disabled) from merging unrelated multiplexed client streams into one
++	// unbounded trace. Safe when no thread-per-request native runtime relies on
++	// the generic process fallback for client-span parenting.
++	DisableClientThreadBind bool `yaml:"disable_client_thread_bind" env:"OTEL_EBPF_BPF_DISABLE_CLIENT_THREAD_BIND" validate:"boolean"`
++
+ 	// Optimizes for getting requests information immediately when request response is seen
+ 	HighRequestVolume bool `yaml:"high_request_volume" env:"OTEL_EBPF_BPF_HIGH_REQUEST_VOLUME" validate:"boolean"`
+ 
+diff --git a/pkg/internal/ebpf/generictracer/generictracer.go b/pkg/internal/ebpf/generictracer/generictracer.go
+index a0f9d305..75f284c9 100644
+--- a/pkg/internal/ebpf/generictracer/generictracer.go
++++ b/pkg/internal/ebpf/generictracer/generictracer.go
+@@ -215,6 +215,12 @@ func (p *Tracer) constants() map[string]any {
+ 		m["disable_black_box_cp"] = uint32(0)
+ 	}
+ 
++	if p.cfg.EBPF.DisableClientThreadBind {
++		m["disable_client_thread_bind"] = uint32(1)
++	} else {
++		m["disable_client_thread_bind"] = uint32(0)
++	}
++
+ 	m["http_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.HTTP
+ 	m["tcp_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.TCP
+ 	m["mysql_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.MySQL
+diff --git a/pkg/internal/ebpf/tpinjector/tpinjector.go b/pkg/internal/ebpf/tpinjector/tpinjector.go
+index 61ada3f3..10afa807 100644
+--- a/pkg/internal/ebpf/tpinjector/tpinjector.go
++++ b/pkg/internal/ebpf/tpinjector/tpinjector.go
+@@ -92,11 +92,17 @@ func (p *Tracer) constants() map[string]any {
+ 		filterPids = 0
+ 	}
+ 
++	disableClientThreadBind := uint32(0)
++	if p.cfg.EBPF.DisableClientThreadBind {
++		disableClientThreadBind = 1
++	}
++
+ 	return map[string]any{
+-		"filter_pids":          filterPids,
+-		"max_transaction_time": uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
+-		"inject_flags":         flags,
+-		"g_bpf_debug":          p.cfg.EBPF.BpfDebug,
++		"filter_pids":                filterPids,
++		"max_transaction_time":       uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
++		"inject_flags":               flags,
++		"g_bpf_debug":                p.cfg.EBPF.BpfDebug,
++		"disable_client_thread_bind": disableClientThreadBind,
+ 	}
+ }
+ 

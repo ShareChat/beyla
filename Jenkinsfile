@@ -1,8 +1,13 @@
-// Custom Beyla image build (ShareChat) — adds a configurable large-header
-// traceparent scan window (OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB) on top of
-// the Beyla 3.24 base (.obi-src pinned to v3.24.0 / 54f2f639), which carries BOTH
-// mega-trace fixes the 3.22 line lacked: the connection/Kafka stale-parent fix AND
-// the readMimeHeader stale-bytes fix.
+// Custom Beyla image build (ShareChat) — on top of the Beyla 3.24 base
+// (.obi-src pinned to v3.24.0 / 54f2f639, which carries BOTH mega-trace fixes the
+// 3.22 line lacked: the connection/Kafka stale-parent fix AND the readMimeHeader
+// stale-bytes fix), applies two ShareChat patches in sequence:
+//   0004 — configurable large-header traceparent scan window
+//          (OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB)
+//   0007 — disable_client_thread_bind (OTEL_EBPF_BPF_DISABLE_CLIENT_THREAD_BIND):
+//          skips the thread/process-bound client-parenting fallback so
+//          single-threaded runtimes (Node.js, instrumentation off) stop merging
+//          multiplexed client streams into one unbounded mega-trace.
 //
 // The code change lives as a patch in patches/ (the .obi-src submodule points at
 // grafana upstream and is not pushable), applied to .obi-src at build time BEFORE
@@ -60,7 +65,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "custom-beyla-v3.24.0"
+    imagetags  = "custom-beyla-v3.24.0-threadbind"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }
@@ -69,6 +74,7 @@ spec:
     stage('build') {
       when {
         anyOf {
+          branch 'tphdr-clean-base'
           branch 'tphdr-debug-logging'
           branch 'master'
         }
@@ -92,6 +98,7 @@ spec:
     stage('push') {
       when {
         anyOf {
+          branch 'tphdr-clean-base'
           branch 'tphdr-debug-logging'
           branch 'master'
         }
