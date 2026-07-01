@@ -1,0 +1,19 @@
+diff --git a/bpf/tpinjector/tpinjector.c b/bpf/tpinjector/tpinjector.c
+index 963586d6..e26fc044 100644
+--- a/bpf/tpinjector/tpinjector.c
++++ b/bpf/tpinjector/tpinjector.c
+@@ -875,6 +875,14 @@ static __always_inline bool handle_existing_tp_pid(struct sk_msg_md *msg,
+     if (is_http) {
+         if (inject_flags & k_inject_http_headers) {
+             write_http_traceparent(msg, tp_pid);
++            // 0009: clear the egress entry after injecting. Otherwise, on an
++            // HTTP/1.1 keep-alive connection the egress key {s_port,d_port,
++            // stream_id=0} is stable across requests, so every subsequent
++            // request re-injects THIS request's context as its parent — a
++            // single connection-setup span becomes the sticky parent for
++            // thousands of unrelated requests (mega-trace). Clearing forces the
++            // next request on the pooled connection to mint fresh trace context.
++            clear_tp_info_pid(e_key);
+         } else {
+             clear_tp_info_pid(e_key);
+         }

@@ -13,6 +13,11 @@
 //          fd changes; resets after each outgoing write). Goal: keep
 //          BEYLA_NODEJS_ENABLED=true (per-request context → no mega-spans) while
 //          cutting the runtime instrumentation's CPU/latency overhead.
+//   0009 — tpinjector keep-alive clear (tpinjector.c): clear outgoing_trace_map
+//          after injecting the HTTP header, so an HTTP/1.1 keep-alive connection
+//          (stable egress key {s_port,d_port,stream_id=0}) does not re-inject one
+//          request's context as the parent of every later request on the pooled
+//          connection — the CONNECT-span-becomes-sticky-parent mega-trace.
 //
 // The code change lives as a patch in patches/ (the .obi-src submodule points at
 // grafana upstream and is not pushable), applied to .obi-src at build time BEFORE
@@ -70,7 +75,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "custom-beyla-v3.24.0-nodejsdedup"
+    imagetags  = "custom-beyla-v3.24.0-keepalivefix"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }
