@@ -1,0 +1,140 @@
+diff --git a/bpf/common/trace_lifecycle.h b/bpf/common/trace_lifecycle.h
+index de983a86..beb4168e 100644
+--- a/bpf/common/trace_lifecycle.h
++++ b/bpf/common/trace_lifecycle.h
+@@ -52,7 +52,8 @@ static __always_inline void delete_client_trace_info(pid_connection_info_t *pid_
+ 
+ static __always_inline u8 find_trace_for_server_request(connection_info_t *conn,
+                                                         tp_info_t *tp,
+-                                                        const u8 type) {
++                                                        const u8 type,
++                                                        u32 stream_id) {
+     u8 found_tp = 0;
+     connection_info_t sorted_conn = *conn;
+     sort_connection_info(&sorted_conn);
+@@ -67,7 +68,7 @@ static __always_inline u8 find_trace_for_server_request(connection_info_t *conn,
+         bpf_dbg_printk("Looking up tracemap for");
+         dbg_print_http_connection_info(conn);
+ 
+-        existing_tp = trace_info_for_connection(conn, TRACE_TYPE_CLIENT);
++        existing_tp = trace_info_for_connection_stream(conn, TRACE_TYPE_CLIENT, stream_id);
+ 
+         bpf_dbg_printk("existing_tp=%llx", existing_tp);
+ 
+diff --git a/bpf/common/trace_map_key.h b/bpf/common/trace_map_key.h
+index 73dc02e6..c068f1f9 100644
+--- a/bpf/common/trace_map_key.h
++++ b/bpf/common/trace_map_key.h
+@@ -10,4 +10,5 @@
+ typedef struct trace_map_key {
+     connection_info_t conn;
+     u32 type;
++    u32 stream_id; // ShareChat 0006: HTTP/2 stream id (0 for HTTP/1.1 & non-H2)
+ } trace_map_key_t;
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index 2469735f..00e428f6 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -80,6 +80,36 @@ static __always_inline void delete_trace_info_for_connection(connection_info_t *
+     bpf_map_delete_elem(&trace_map, &key);
+ }
+ 
++// ShareChat 0006: stream-scoped variants. HTTP/2 multiplexes many independent
++// streams over one connection; keying trace context by connection alone merges
++// them into a single trace. These key by {conn, type, stream_id} so each H2
++// stream carries its own context. stream_id=0 == the connection-scoped behavior.
++static __always_inline tp_info_pid_t *
++trace_info_for_connection_stream(const connection_info_t *conn, u32 type, u32 stream_id) {
++    trace_map_key_t key = {};
++    trace_key_from_conn(&key, conn, type);
++    key.stream_id = stream_id;
++    return (tp_info_pid_t *)bpf_map_lookup_elem(&trace_map, &key);
++}
++
++static __always_inline void set_trace_info_for_connection_stream(const connection_info_t *conn,
++                                                                 u32 type,
++                                                                 u32 stream_id,
++                                                                 const tp_info_pid_t *info) {
++    trace_map_key_t key = {};
++    trace_key_from_conn(&key, conn, type);
++    key.stream_id = stream_id;
++    bpf_map_update_elem(&trace_map, &key, info, BPF_ANY);
++}
++
++static __always_inline void
++delete_trace_info_for_connection_stream(connection_info_t *conn, u32 type, u32 stream_id) {
++    trace_map_key_t key = {};
++    trace_key_from_conn(&key, conn, type);
++    key.stream_id = stream_id;
++    bpf_map_delete_elem(&trace_map, &key);
++}
++
+ static __always_inline u64 current_epoch(u64 ts) {
+     const u64 temp = ts / NANOSECONDS_PER_EPOCH;
+     return temp * NANOSECONDS_PER_EPOCH;
+diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
+index 1a946245..3ddcd75d 100644
+--- a/bpf/generictracer/protocol_http.h
++++ b/bpf/generictracer/protocol_http.h
+@@ -639,8 +639,8 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
+             //dbg_print_http_connection_info(conn);
+ 
+             // For server requests, we first look for TCP info (setup by TC ingress) and then we fall back to black-box info.
+-            found_tp =
+-                find_trace_for_server_request(&args->pid_conn.conn, &tp_p->tp, EVENT_HTTP_REQUEST);
++            found_tp = find_trace_for_server_request(
++                &args->pid_conn.conn, &tp_p->tp, EVENT_HTTP_REQUEST, 0); // HTTP/1.1: stream_id=0
+         }
+     }
+ 
+diff --git a/bpf/generictracer/protocol_http2.h b/bpf/generictracer/protocol_http2.h
+index 3096c151..dab0bd69 100644
+--- a/bpf/generictracer/protocol_http2.h
++++ b/bpf/generictracer/protocol_http2.h
+@@ -149,7 +149,8 @@ static __always_inline void http2_grpc_start_finalize_server(http2_conn_stream_t
+ 
+     h2g_info->tp = tp_p->tp;
+ 
+-    set_trace_info_for_connection(&h2g_info->conn_info, TRACE_TYPE_SERVER, tp_p);
++    set_trace_info_for_connection_stream(
++        &h2g_info->conn_info, TRACE_TYPE_SERVER, s_key->stream_id, tp_p); // 0006: per-stream
+     server_or_client_trace(EVENT_HTTP_REQUEST,
+                            &h2g_info->conn_info,
+                            k_lw_thread_none,
+@@ -264,7 +265,8 @@ static __always_inline void http2_grpc_start(void *ctx,
+ 
+     h2g_info->tp = tp_p->tp;
+ 
+-    set_trace_info_for_connection(&h2g_info->conn_info, TRACE_TYPE_CLIENT, tp_p);
++    set_trace_info_for_connection_stream(
++        &h2g_info->conn_info, TRACE_TYPE_CLIENT, s_key->stream_id, tp_p); // 0006: per-stream
+     // BPF_NOEXIST so a Go uprobe's HPACK-injected entry (written=1) isn't clobbered
+     server_or_client_trace(EVENT_HTTP_CLIENT,
+                            &h2g_info->conn_info,
+@@ -439,7 +441,10 @@ int obi_protocol_http2_grpc_handle_start_frame_server(void *ctx) {
+     const u32 hpack_len = raw_len > skip ? raw_len - skip : 0;
+     if (!parse_hpack_traceparent(
+             h2g_info->data + k_h2_frame_header_len + prefix, hpack_len, &tp_p->tp)) {
+-        find_trace_for_server_request(&g_ctx->stream.pid_conn.conn, &tp_p->tp, EVENT_HTTP_REQUEST);
++        find_trace_for_server_request(&g_ctx->stream.pid_conn.conn,
++                                      &tp_p->tp,
++                                      EVENT_HTTP_REQUEST,
++                                      g_ctx->stream.stream_id); // 0006: per-stream lookup
+     }
+ 
+     bpf_tail_call(ctx, &jump_table, k_tail_protocol_http2_grpc_handle_start_frame_server_finalize);
+diff --git a/bpf/generictracer/protocol_tcp.h b/bpf/generictracer/protocol_tcp.h
+index b990553f..8b8c3ba7 100644
+--- a/bpf/generictracer/protocol_tcp.h
++++ b/bpf/generictracer/protocol_tcp.h
+@@ -91,8 +91,8 @@ static __always_inline void tcp_get_or_set_trace_info(tcp_req_t *req,
+                            ssl,
+                            orig_dport);
+     } else { // Server
+-        const u8 found =
+-            find_trace_for_server_request(&pid_conn->conn, &req->tp, EVENT_TCP_REQUEST);
++        const u8 found = find_trace_for_server_request(
++            &pid_conn->conn, &req->tp, EVENT_TCP_REQUEST, 0); // TCP: stream_id=0
+         bpf_dbg_printk("Looking up server trace info, found=%d", found);
+         if (found) {
+             urand_bytes(req->tp.span_id, SPAN_ID_SIZE_BYTES);

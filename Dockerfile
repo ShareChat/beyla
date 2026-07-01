@@ -108,6 +108,7 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     make generate && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0004-large-header-traceparent-scan-v324.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0005-tp-reuse-breaker.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0006-http2-stream-scoped-trace.patch ) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
     echo "### Asserting large-header traceparent backport landed in vendored OBI" && \
@@ -115,7 +116,10 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     grep -rq "ObiParseTraceparentHttpAppend" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/ || (echo "FATAL: regenerated bindings missing new program — 'make generate' did not run on patched C" && exit 1) && \
     echo "### Asserting tp-reuse-breaker landed in vendored OBI" && \
     grep -q "tp_reuse_threshold" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/generictracer.go || (echo "FATAL: tp-reuse-breaker wiring missing from vendored OBI" && exit 1) && \
-    grep -rq "tp_reuse_count" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/ || (echo "FATAL: tp_reuse_count map missing from regenerated bindings" && exit 1) \
+    grep -rq "tp_reuse_count" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/ || (echo "FATAL: tp_reuse_count map missing from regenerated bindings" && exit 1) && \
+    echo "### Asserting HTTP/2 stream-scoped trace-map key landed" && \
+    grep -q "stream_id" .obi-src/bpf/common/trace_map_key.h || (echo "FATAL: 0006 trace_map_key stream_id missing (patch did not apply)" && exit 1) && \
+    grep -q "set_trace_info_for_connection_stream" .obi-src/bpf/common/tracing.h || (echo "FATAL: 0006 stream accessors missing (patch did not apply)" && exit 1) \
     ; fi
 
 # The Java agent is embedded at Go compile time, so the platform-specific jar
