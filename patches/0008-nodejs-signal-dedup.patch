@@ -1,0 +1,49 @@
+diff --git a/pkg/internal/nodejs/fdextractor.js b/pkg/internal/nodejs/fdextractor.js
+index 4205bcb5..45c2027c 100644
+--- a/pkg/internal/nodejs/fdextractor.js
++++ b/pkg/internal/nodejs/fdextractor.js
+@@ -46,6 +46,16 @@ net.Server.prototype.emit = function (event, ...args) {
+ 
+ const pad4 = n => String(n).padStart(4, '0');
+ 
++// Tracks the last incomingFd signalled to the BPF layer via the obi-ctx path,
++// so redundant consecutive signals for the same active request are skipped
++// (Node is single-threaded: if the same request's callbacks run back-to-back,
++// traces_ctx_v1 already holds the right context). Reset to -1 after every
++// outgoing write, because the BPF client-trace path overwrites traces_ctx_v1
++// with the client span, so the next callback MUST re-signal to restore the
++// server context. The blocking fs.accessSync per hop is this agent's dominant
++// cost; deduping cuts it proportional to how much callbacks cluster by request.
++let lastSignaledFd = -1;
++
+ function correlate(incomingFd, outFd, socket) {
+   if (incomingFd < 0 || outFd < 0 || incomingFd === outFd) {
+     return Promise.resolve();
+@@ -97,6 +107,9 @@ net.Socket.prototype.write = function (data, ...rest) {
+   if (store) {
+     const outFd = this._handle && this._handle.fd;
+     correlate(store.incomingFd, outFd, this);
++    // The outgoing write overwrites traces_ctx_v1 with the client span in-kernel,
++    // so force the next async callback to re-signal and restore server context.
++    lastSignaledFd = -1;
+   }
+ 
+   return doWrite();
+@@ -110,8 +123,17 @@ createHook({
+   before() {
+     const store = als.getStore();
+     if (store && store.incomingFd != null && store.incomingFd >= 0) {
++      // Dedup: only signal when the active request's fd changed. Re-signalling
++      // the same fd back-to-back is redundant (traces_ctx_v1 already holds it);
++      // the accessSync syscall is the dominant per-hop cost we want to cut.
++      // lastSignaledFd is reset to -1 by the write wrapper after each outgoing
++      // call, so context is still restored after the client-trace path clobbers it.
++      if (store.incomingFd === lastSignaledFd) {
++        return;
++      }
+       try {
+         fs.accessSync(`/dev/null/obi-ctx/${pad4(store.incomingFd)}`);
++        lastSignaledFd = store.incomingFd;
+       } catch (_) {}
+     }
+   },

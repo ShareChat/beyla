@@ -8,6 +8,11 @@
 //          skips the thread/process-bound client-parenting fallback so
 //          single-threaded runtimes (Node.js, instrumentation off) stop merging
 //          multiplexed client streams into one unbounded mega-trace.
+//   0008 — nodejs signal-dedup (fdextractor.js): dedups the per-async-hop
+//          obi-ctx accessSync syscall (only re-signals when the active request
+//          fd changes; resets after each outgoing write). Goal: keep
+//          BEYLA_NODEJS_ENABLED=true (per-request context → no mega-spans) while
+//          cutting the runtime instrumentation's CPU/latency overhead.
 //
 // The code change lives as a patch in patches/ (the .obi-src submodule points at
 // grafana upstream and is not pushable), applied to .obi-src at build time BEFORE
@@ -65,7 +70,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "custom-beyla-v3.24.0-threadbind"
+    imagetags  = "custom-beyla-v3.24.0-nodejsdedup"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }
