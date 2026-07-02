@@ -22,6 +22,13 @@
 //          (stable egress key {s_port,d_port,stream_id=0}) does not re-inject one
 //          request's context as the parent of every later request on the pooled
 //          connection — the CONNECT-span-becomes-sticky-parent mega-trace.
+//   0011 — gotracer stale goroutine-parent guard (go_common.h /
+//          OTEL_EBPF_BPF_DISABLE_GO_STALE_PARENT): client_trace_parent only
+//          inherits an ancestor goroutine's trace when that trace started within
+//          max_transaction_time. A long-lived ancestor goroutine (connection
+//          handler, worker pool, background loop) keeps a stale go_trace_map
+//          entry that otherwise merges unrelated Go requests into one unbounded
+//          trace (e13n/user-entity/social-graph residual after 0009/black-box).
 //
 // The code change lives as a patch in patches/ (the .obi-src submodule points at
 // grafana upstream and is not pushable), applied to .obi-src at build time BEFORE
@@ -79,7 +86,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "custom-beyla-v3.24.0-h2adopt"
+    imagetags  = "custom-beyla-v3.24.0-gostale"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }

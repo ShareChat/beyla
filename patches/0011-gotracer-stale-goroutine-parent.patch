@@ -1,0 +1,94 @@
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index 006c22c3..506c17c4 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -25,6 +25,15 @@ volatile const u32 disable_black_box_cp;
+ // request native runtime relies on the generic process fallback.
+ volatile const u32 disable_client_thread_bind;
+ 
++// When set, a *client* span only inherits a trace id from an ancestor goroutine
++// when that ancestor's trace started within max_transaction_time. Long-lived
++// ancestor goroutines (connection handlers, worker pools, background loops) keep
++// a stale go_trace_map entry that would otherwise be reused for every later
++// request, merging unrelated requests into one unbounded "mega-trace". When the
++// ancestor trace is older than the transaction window, the client mints a fresh
++// trace instead. Off by default; only affects the Go uprobe tracer.
++volatile const u32 disable_go_stale_parent;
++
+ #define TRACE_TYPE_SERVER 1
+ #define TRACE_TYPE_CLIENT 2
+ 
+diff --git a/bpf/gotracer/go_common.h b/bpf/gotracer/go_common.h
+index 26b03f11..f17dbdd0 100644
+--- a/bpf/gotracer/go_common.h
++++ b/bpf/gotracer/go_common.h
+@@ -25,6 +25,7 @@
+ #include <common/trace_util.h>
+ #include <common/tracing.h>
+ #include <common/tp_info.h>
++#include <common/trace_helpers.h>
+ 
+ #include <gotracer/go_offsets.h>
+ 
+@@ -337,8 +338,20 @@ static __always_inline u8 client_trace_parent(void *goroutine_addr, tp_info_t *t
+     if (!found_trace_id) {
+         tp_info_t *tp = tp_info_from_parent_go(&g_key, 0);
+ 
++        // 0011: A long-lived ancestor goroutine (connection handler, worker pool,
++        // background loop) keeps a stale go_trace_map entry. Reusing it merges
++        // unrelated requests into one unbounded trace. When disable_go_stale_parent
++        // is set, only inherit the ancestor's trace when it started within
++        // max_transaction_time; otherwise mint a fresh trace id.
+         if (tp) {
+-            tp_from_parent(tp_i, tp);
++            const u64 now = bpf_ktime_get_ns();
++            if (disable_go_stale_parent &&
++                (now < tp->ts || (now - tp->ts) >= max_transaction_time)) {
++                bpf_dbg_printk("0011: stale ancestor goroutine trace, minting fresh trace id");
++                urand_bytes(tp_i->trace_id, TRACE_ID_SIZE_BYTES);
++            } else {
++                tp_from_parent(tp_i, tp);
++            }
+         } else {
+             urand_bytes(tp_i->trace_id, TRACE_ID_SIZE_BYTES);
+         }
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index 77fa3f06..24d0838b 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -105,6 +105,13 @@ type EBPFTracer struct {
+ 	// instrumented apps don't set their own traceparent.
+ 	DisableH2TpAdopt bool `yaml:"disable_h2_tp_adopt" env:"OTEL_EBPF_BPF_DISABLE_H2_TP_ADOPT" validate:"boolean"`
+ 
++	// When set, a Go client span only inherits an ancestor goroutine's trace id
++	// when that ancestor's trace started within max_transaction_time. Prevents a
++	// long-lived ancestor goroutine (connection handler, worker pool, background
++	// loop) whose go_trace_map entry never clears from merging unrelated requests
++	// into one unbounded trace. Off by default; only affects the Go uprobe tracer.
++	DisableGoStaleParent bool `yaml:"disable_go_stale_parent" env:"OTEL_EBPF_BPF_DISABLE_GO_STALE_PARENT" validate:"boolean"`
++
+ 	// Optimizes for getting requests information immediately when request response is seen
+ 	HighRequestVolume bool `yaml:"high_request_volume" env:"OTEL_EBPF_BPF_HIGH_REQUEST_VOLUME" validate:"boolean"`
+ 
+diff --git a/pkg/internal/ebpf/gotracer/gotracer.go b/pkg/internal/ebpf/gotracer/gotracer.go
+index ab77631c..702dbe4c 100644
+--- a/pkg/internal/ebpf/gotracer/gotracer.go
++++ b/pkg/internal/ebpf/gotracer/gotracer.go
+@@ -132,11 +132,17 @@ func (p *Tracer) constants() map[string]any {
+ 		blackBoxCP = uint32(1)
+ 	}
+ 
++	goStaleParent := uint32(0)
++	if p.cfg.DisableGoStaleParent {
++		goStaleParent = uint32(1)
++	}
++
+ 	m := map[string]any{
+ 		"g_bpf_debug":               p.cfg.BpfDebug,
+ 		"g_bpf_header_propagation":  p.supportsContextPropagation(),
+ 		"wakeup_data_bytes":         uint32(p.cfg.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{})),
+ 		"disable_black_box_cp":      blackBoxCP,
++		"disable_go_stale_parent":   goStaleParent,
+ 		"attr_type_invalid":         uint64(attribute.INVALID),
+ 		"attr_type_bool":            uint64(attribute.BOOL),
+ 		"attr_type_int64":           uint64(attribute.INT64),

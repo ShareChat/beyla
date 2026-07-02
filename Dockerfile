@@ -111,9 +111,11 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0008-nodejs-signal-dedup.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0009-tpinjector-clear-egress-keepalive.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0010-tpinjector-no-h2-self-adopt.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0011-gotracer-stale-goroutine-parent.patch ) && \
     echo "### Asserting tpinjector patches (0009 keep-alive clear + 0010 h2 no-self-adopt) applied to eBPF C before generate" && \
     grep -q "0009: clear the egress entry" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0009 not applied to tpinjector.c" && exit 1) && \
     grep -q "disable_h2_tp_adopt" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0010 not applied to tpinjector.c" && exit 1) && \
+    grep -q "disable_go_stale_parent" .obi-src/bpf/gotracer/go_common.h || (echo "FATAL: 0011 not applied to go_common.h" && exit 1) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
     echo "### Asserting large-header traceparent backport landed in vendored OBI" && \
@@ -126,7 +128,10 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     grep -q "lastSignaledFd" vendor/go.opentelemetry.io/obi/pkg/internal/nodejs/fdextractor.js || (echo "FATAL: 0008 nodejs dedup missing from vendored fdextractor.js" && exit 1) && \
     echo "### Asserting h2 no-self-adopt (0010) landed in vendored OBI" && \
     grep -q "DisableH2TpAdopt" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0010 config field missing from vendored OBI" && exit 1) && \
-    grep -q "disable_h2_tp_adopt" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector/tpinjector.go || (echo "FATAL: 0010 loader wiring missing from vendored OBI" && exit 1) \
+    grep -q "disable_h2_tp_adopt" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector/tpinjector.go || (echo "FATAL: 0010 loader wiring missing from vendored OBI" && exit 1) && \
+    echo "### Asserting go stale-goroutine-parent (0011) landed in vendored OBI" && \
+    grep -q "DisableGoStaleParent" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0011 config field missing from vendored OBI" && exit 1) && \
+    grep -q "disable_go_stale_parent" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0011 loader wiring missing from vendored OBI" && exit 1) \
     ; fi
 
 # The Java agent is embedded at Go compile time, so the platform-specific jar
