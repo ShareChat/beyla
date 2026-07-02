@@ -96,6 +96,7 @@ spec:
       when {
         anyOf {
           branch 'tphdr-clean-base'
+          branch 'tphdr-0012-tp-reuse-breaker'
           branch 'tphdr-debug-logging'
           branch 'master'
         }
@@ -120,6 +121,7 @@ spec:
       when {
         anyOf {
           branch 'tphdr-clean-base'
+          branch 'tphdr-0012-tp-reuse-breaker'
           branch 'tphdr-debug-logging'
           branch 'master'
         }
