@@ -13,6 +13,10 @@
 //          fd changes; resets after each outgoing write). Goal: keep
 //          BEYLA_NODEJS_ENABLED=true (per-request context → no mega-spans) while
 //          cutting the runtime instrumentation's CPU/latency overhead.
+//   0010 — tpinjector H2 no-self-adopt (OTEL_EBPF_BPF_DISABLE_H2_TP_ADOPT):
+//          stop find_existing_h2_tp adopting a traceparent replayed via grpc-go's
+//          HPACK dynamic table (Beyla's own injected value), which merged every
+//          multiplexed gRPC stream into one trace_id (network-relevance/ads-dnb).
 //   0009 — tpinjector keep-alive clear (tpinjector.c): clear outgoing_trace_map
 //          after injecting the HTTP header, so an HTTP/1.1 keep-alive connection
 //          (stable egress key {s_port,d_port,stream_id=0}) does not re-inject one
@@ -75,7 +79,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "custom-beyla-v3.24.0-keepalivefix"
+    imagetags  = "custom-beyla-v3.24.0-h2adopt"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }
