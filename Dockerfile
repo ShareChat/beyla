@@ -115,6 +115,7 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0012-tp-reuse-breaker.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0013-trace-reuse-breaker.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0015-originator-errorlog.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0016-tp-request-scope.patch ) && \
     echo "### Asserting tpinjector patches (0009 keep-alive clear + 0010 h2 no-self-adopt) applied to eBPF C before generate" && \
     grep -q "0009: clear the egress entry" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0009 not applied to tpinjector.c" && exit 1) && \
     grep -q "disable_h2_tp_adopt" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0010 not applied to tpinjector.c" && exit 1) && \
@@ -125,6 +126,8 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     grep -q "trace_reuse_should_break" .obi-src/bpf/common/tracing.h || (echo "FATAL: 0013 trace-reuse helper missing from tracing.h" && exit 1) && \
     test -f .obi-src/bpf/maps/trace_reuse_count.h || (echo "FATAL: 0013 trace_reuse_count map missing" && exit 1) && \
     grep -q "BEYLA_ORIGINATOR" .obi-src/pkg/ebpf/common/common.go || (echo "FATAL: 0015 originator log missing" && exit 1) && \
+    grep -q "tp_request_scope" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0016 request-scope guard missing from tpinjector.c" && exit 1) && \
+    grep -q "TPRequestScope" .obi-src/pkg/config/ebpf_tracer.go || (echo "FATAL: 0016 config field missing" && exit 1) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
     echo "### Asserting large-header traceparent backport landed in vendored OBI" && \

@@ -1,0 +1,89 @@
+diff --git a/bpf/tpinjector/tpinjector.c b/bpf/tpinjector/tpinjector.c
+index 065a3bd..fa3a4cc 100644
+--- a/bpf/tpinjector/tpinjector.c
++++ b/bpf/tpinjector/tpinjector.c
+@@ -105,6 +105,20 @@ volatile const u32 inject_flags =
+ // (exclude_otel_instrumented_services=true), which is our production case.
+ volatile const u32 disable_h2_tp_adopt;
+ 
++// 0016: request-scoped egress context. When set, a cached outgoing_trace_map
++// entry that was already injected into an earlier request (written==1) is
++// treated as STALE the moment a NEW HTTP request start is detected on the same
++// keep-alive connection (protocol_detector()==true is the request-boundary
++// signal). The stale entry is dropped and the new request falls through to the
++// find/create path, minting fresh per-request context. This restores v2.6.x
++// one-shot injection semantics, but evicts at the NEXT request boundary
++// instead of immediately after injection, so the entry stays alive within its
++// own request for the generic tracer's client-span emitter to adopt
++// (stitching preserved). Note: guards the HTTP-header injection path only; the
++// TCP-options path (schedule_write_tcp_option) is unaffected — acceptable for
++// context_propagation=headers deployments where TCP options are disabled.
++volatile const u32 tp_request_scope;
++
+ // Kind 25 is unassigned per IANA TCP Parameters registry (released 2000-12-18)
+ // Better than experimental options (253-254) which must not be shipped as defaults
+ enum { k_tcp_option_kind_otel = 25 };
+@@ -882,6 +896,20 @@ static __always_inline bool handle_existing_tp_pid(struct sk_msg_md *msg,
+ 
+     const bool is_http = protocol_detector(msg, id, &p_conn->conn);
+     if (is_http) {
++        // 0016: is_http means THIS msg is the start of a NEW HTTP request on
++        // this connection. If the cached entry was already injected into an
++        // earlier request (written==1), it belongs to that request —
++        // re-injecting it would chain every request on this keep-alive
++        // connection into one trace (the 0009 tail-call made the clear below
++        // unreachable on the happy path, so written entries survive and get
++        // replayed). Drop the stale entry and return false: the caller falls
++        // through to the find/create flow and this request mints fresh
++        // per-request context.
++        if (tp_request_scope && tp_pid->written) {
++            bpf_dbg_printk("0016: stale egress tp at new request start, minting fresh");
++            clear_tp_info_pid(e_key);
++            return false;
++        }
+         if (inject_flags & k_inject_http_headers) {
+             write_http_traceparent(msg, tp_pid);
+             // 0009: clear the egress entry after injecting. Otherwise, on an
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index f182799..4e148f8 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -105,6 +105,14 @@ type EBPFTracer struct {
+ 	// instrumented apps don't set their own traceparent.
+ 	DisableH2TpAdopt bool `yaml:"disable_h2_tp_adopt" env:"OTEL_EBPF_BPF_DISABLE_H2_TP_ADOPT" validate:"boolean"`
+ 
++	// Request-scoped egress context (tpinjector). When set, a cached egress
++	// traceparent entry that was already injected into an earlier request is
++	// treated as stale at the next HTTP request start on the same keep-alive
++	// connection: the entry is dropped and the new request mints fresh context.
++	// Restores v2.6.x one-shot injection semantics, evicting at the request
++	// boundary so same-request client-span adoption (stitching) still works.
++	TPRequestScope bool `yaml:"tp_request_scope" env:"OTEL_EBPF_BPF_TP_REQUEST_SCOPE" validate:"boolean"`
++
+ 	// When set, a Go client span only inherits an ancestor goroutine's trace id
+ 	// when that ancestor's trace started within max_transaction_time. Prevents a
+ 	// long-lived ancestor goroutine (connection handler, worker pool, background
+diff --git a/pkg/internal/ebpf/tpinjector/tpinjector.go b/pkg/internal/ebpf/tpinjector/tpinjector.go
+index aa53742..8303ce7 100644
+--- a/pkg/internal/ebpf/tpinjector/tpinjector.go
++++ b/pkg/internal/ebpf/tpinjector/tpinjector.go
+@@ -102,6 +102,11 @@ func (p *Tracer) constants() map[string]any {
+ 		disableH2TpAdopt = 1
+ 	}
+ 
++	tpRequestScope := uint32(0)
++	if p.cfg.EBPF.TPRequestScope {
++		tpRequestScope = 1
++	}
++
+ 	return map[string]any{
+ 		"filter_pids":                filterPids,
+ 		"max_transaction_time":       uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
+@@ -109,6 +114,7 @@ func (p *Tracer) constants() map[string]any {
+ 		"g_bpf_debug":                p.cfg.EBPF.BpfDebug,
+ 		"disable_client_thread_bind": disableClientThreadBind,
+ 		"disable_h2_tp_adopt":        disableH2TpAdopt,
++		"tp_request_scope":           tpRequestScope,
+ 	}
+ }
+ 
