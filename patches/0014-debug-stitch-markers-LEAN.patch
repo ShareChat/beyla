@@ -1,0 +1,36 @@
+diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
+index 4eed00f..b4ed28f 100644
+--- a/bpf/generictracer/protocol_http.h
++++ b/bpf/generictracer/protocol_http.h
+@@ -855,6 +855,8 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
+     if (tp_p && tp_p->req_type == EVENT_HTTP_CLIENT && tp_p->written &&
+         tp_p->pid == args->pid_conn.pid) {
+         bpf_dbg_printk("found tp info previously set by sock msg");
++        bpf_dbg_printk("STITCHDBG cli-ADOPT s=%d d=%d sid=%llx",
++                       e_key.s_port, e_key.d_port, *(u64 *)tp_p->tp.span_id);
+         // we've already got a tp_info_pid_t setup by the sockmsg program, use
+         // that instead
+         set_trace_info_for_connection(&args->pid_conn.conn, TRACE_TYPE_CLIENT, tp_p);
+@@ -863,6 +865,9 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
+         goto skip_tp;
+     }
+ 
++    bpf_dbg_printk("STITCHDBG cli-MINT-nomatch s=%d d=%d (no sock_msg entry to adopt)",
++                   e_key.s_port, e_key.d_port);
++
+     tp_p = (tp_info_pid_t *)tp_info_mem();
+ 
+     if (!tp_p) {
+diff --git a/bpf/tpinjector/tpinjector.c b/bpf/tpinjector/tpinjector.c
+index 92ac8bb..f45da17 100644
+--- a/bpf/tpinjector/tpinjector.c
++++ b/bpf/tpinjector/tpinjector.c
+@@ -883,6 +883,8 @@ static __always_inline bool handle_existing_tp_pid(struct sk_msg_md *msg,
+     const bool is_http = protocol_detector(msg, id, &p_conn->conn);
+     if (is_http) {
+         if (inject_flags & k_inject_http_headers) {
++            bpf_dbg_printk("STITCHDBG inject s=%d d=%d sid=%llx",
++                           e_key->s_port, e_key->d_port, *(u64 *)tp_pid->tp.span_id);
+             write_http_traceparent(msg, tp_pid);
+         } else {
+             clear_tp_info_pid(e_key);

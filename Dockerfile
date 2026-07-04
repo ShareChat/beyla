@@ -109,13 +109,12 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0004-large-header-traceparent-scan-v324.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0007-disable-client-thread-bind-v324.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0008-nodejs-signal-dedup.patch ) && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0009-tpinjector-clear-egress-keepalive.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0010-tpinjector-no-h2-self-adopt.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0011-gotracer-stale-goroutine-parent.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0012-tp-reuse-breaker.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0013-trace-reuse-breaker.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0014-debug-stitch-markers-LEAN.patch ) && \
     echo "### Asserting tpinjector patches (0009 keep-alive clear + 0010 h2 no-self-adopt) applied to eBPF C before generate" && \
-    grep -q "0009: clear the egress entry" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0009 not applied to tpinjector.c" && exit 1) && \
     grep -q "disable_h2_tp_adopt" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0010 not applied to tpinjector.c" && exit 1) && \
     grep -q "disable_go_stale_parent" .obi-src/bpf/gotracer/go_common.h || (echo "FATAL: 0011 not applied to go_common.h" && exit 1) && \
     grep -q "tp_reuse_should_break" .obi-src/bpf/common/tracing.h || (echo "FATAL: 0012 reuse-breaker helper missing from tracing.h" && exit 1) && \
@@ -123,6 +122,7 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     grep -q "tp_reuse_should_break" .obi-src/bpf/gotracer/go_grpc.c || (echo "FATAL: 0012 grpc server guard missing from go_grpc.c" && exit 1) && \
     grep -q "trace_reuse_should_break" .obi-src/bpf/common/tracing.h || (echo "FATAL: 0013 trace-reuse helper missing from tracing.h" && exit 1) && \
     test -f .obi-src/bpf/maps/trace_reuse_count.h || (echo "FATAL: 0013 trace_reuse_count map missing" && exit 1) && \
+    grep -q "STITCHDBG" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: lean debug marker missing" && exit 1) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
     echo "### Asserting large-header traceparent backport landed in vendored OBI" && \
