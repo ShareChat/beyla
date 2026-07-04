@@ -1,5 +1,5 @@
 diff --git a/pkg/ebpf/common/common.go b/pkg/ebpf/common/common.go
-index 1e5a78a..24825ea 100644
+index 1e5a78a..9d01233 100644
 --- a/pkg/ebpf/common/common.go
 +++ b/pkg/ebpf/common/common.go
 @@ -13,6 +13,7 @@ import (
@@ -10,7 +10,15 @@ index 1e5a78a..24825ea 100644
  	"strings"
  	"sync"
  	"time"
-@@ -456,6 +457,48 @@ func (ctx *EBPFParseContext) finalizeSpans(spans []request.Span) {
+@@ -446,6 +447,7 @@ func finalizeParsedSpan(parseCtx *EBPFParseContext, span request.Span, ignore bo
+ 	}
+ 
+ 	parseCtx.consumePendingSpanLinks(&span)
++	trackOriginator(&span)
+ 	return span, false, nil
+ }
+ 
+@@ -456,6 +458,46 @@ func (ctx *EBPFParseContext) finalizeSpans(spans []request.Span) {
  
  	for i := range spans {
  		ctx.consumePendingSpanLinks(&spans[i])
@@ -18,12 +26,10 @@ index 1e5a78a..24825ea 100644
 +	}
 +}
 +
-+// ShareChat originator-hunt: emitted at ERROR level so operators can set
-+// BEYLA_LOG_LEVEL=error and see ONLY this line (no info/debug noise). Counts, per
-+// beyla pod (i.e. per node), how many spans land under each trace id; when a trace
-+// id crosses OTEL_EBPF_BPF_ORIGINATOR_LOG_THRESHOLD it logs once, naming the local
-+// service accumulating under it. Grep a hot trace_id across nodes to reconstruct
-+// the propagation chain and find the reuse originator. Default 0 = disabled.
++// ShareChat originator-hunt: ERROR level so BEYLA_LOG_LEVEL=error shows ONLY this.
++// Per beyla pod, counts spans per trace id; when a trace id crosses
++// OTEL_EBPF_BPF_ORIGINATOR_LOG_THRESHOLD it logs once, naming the local service.
++// Grep a hot trace_id across nodes to find the reuse originator. Default 0=off.
 +var originatorLogThreshold = func() int {
 +	if v, err := strconv.Atoi(os.Getenv("OTEL_EBPF_BPF_ORIGINATOR_LOG_THRESHOLD")); err == nil {
 +		return v
@@ -42,13 +48,13 @@ index 1e5a78a..24825ea 100644
 +	}
 +	tid := s.TraceID.String()
 +	originatorMu.Lock()
-+	if len(originatorCount) > 300000 { // crude cap; reset rather than grow unbounded
++	if len(originatorCount) > 300000 {
 +		originatorCount = make(map[string]int, 4096)
 +	}
 +	originatorCount[tid]++
 +	n := originatorCount[tid]
 +	originatorMu.Unlock()
-+	if n == originatorLogThreshold { // log exactly once, at the crossing
++	if n == originatorLogThreshold {
 +		slog.Error("BEYLA_ORIGINATOR trace reuse crossed threshold",
 +			"trace_id", tid,
 +			"service", s.Service.UID.Name,
