@@ -106,49 +106,12 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     export BPF_CLANG=clang-22 && \
     export BPF_CFLAGS="-O2 -g -Wall -Werror" && \
     make generate && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0004-large-header-traceparent-scan-v324.patch ) && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0007-disable-client-thread-bind-v324.patch ) && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0008-nodejs-signal-dedup.patch ) && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0009-tpinjector-clear-egress-keepalive.patch ) && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0010-tpinjector-no-h2-self-adopt.patch ) && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0011-gotracer-stale-goroutine-parent.patch ) && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0012-tp-reuse-breaker.patch ) && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0013-trace-reuse-breaker.patch ) && \
-    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0014-debug-stitch-markers.patch ) && \
-    echo "### Asserting tpinjector patches (0009 keep-alive clear + 0010 h2 no-self-adopt) applied to eBPF C before generate" && \
-    grep -q "0009: clear the egress entry" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0009 not applied to tpinjector.c" && exit 1) && \
-    grep -q "disable_h2_tp_adopt" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0010 not applied to tpinjector.c" && exit 1) && \
-    grep -q "disable_go_stale_parent" .obi-src/bpf/gotracer/go_common.h || (echo "FATAL: 0011 not applied to go_common.h" && exit 1) && \
-    grep -q "tp_reuse_should_break" .obi-src/bpf/common/tracing.h || (echo "FATAL: 0012 reuse-breaker helper missing from tracing.h" && exit 1) && \
-    test -f .obi-src/bpf/maps/tp_reuse_count.h || (echo "FATAL: 0012 tp_reuse_count map missing" && exit 1) && \
-    grep -q "tp_reuse_should_break" .obi-src/bpf/gotracer/go_grpc.c || (echo "FATAL: 0012 grpc server guard missing from go_grpc.c" && exit 1) && \
-    grep -q "trace_reuse_should_break" .obi-src/bpf/common/tracing.h || (echo "FATAL: 0013 trace-reuse helper missing from tracing.h" && exit 1) && \
-    test -f .obi-src/bpf/maps/trace_reuse_count.h || (echo "FATAL: 0013 trace_reuse_count map missing" && exit 1) && \
-    grep -q "STITCHDBG" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0014 debug marker missing" && exit 1) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0001-debug-stitch-markers-STOCK.patch ) && \
+    echo "### STOCK CONTROL: only debug markers, no ShareChat stack" && \
+    grep -q "STITCHDBG" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: stock debug marker missing" && exit 1) && \
+    grep -q "STITCHDBG" .obi-src/bpf/generictracer/protocol_http.h || (echo "FATAL: stock read-side marker missing" && exit 1) && \
     ( cd .obi-src && make generate ) && \
-    make copy-obi-vendor && \
-    echo "### Asserting large-header traceparent backport landed in vendored OBI" && \
-    grep -q "bpf_max_request_tp_parse_size_kb" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: loader wiring missing from vendored OBI" && exit 1) && \
-    grep -rq "ObiParseTraceparentHttpAppend" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/ || (echo "FATAL: regenerated bindings missing new program — 'make generate' did not run on patched C" && exit 1) && \
-    echo "### Asserting disable_client_thread_bind (0007) landed in vendored OBI" && \
-    grep -q "DisableClientThreadBind" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0007 config field missing from vendored OBI" && exit 1) && \
-    grep -q "disable_client_thread_bind" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/generictracer.go || (echo "FATAL: 0007 loader wiring missing from vendored OBI" && exit 1) && \
-    echo "### Asserting nodejs signal-dedup (0008) landed in vendored OBI" && \
-    grep -q "lastSignaledFd" vendor/go.opentelemetry.io/obi/pkg/internal/nodejs/fdextractor.js || (echo "FATAL: 0008 nodejs dedup missing from vendored fdextractor.js" && exit 1) && \
-    echo "### Asserting h2 no-self-adopt (0010) landed in vendored OBI" && \
-    grep -q "DisableH2TpAdopt" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0010 config field missing from vendored OBI" && exit 1) && \
-    grep -q "disable_h2_tp_adopt" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector/tpinjector.go || (echo "FATAL: 0010 loader wiring missing from vendored OBI" && exit 1) && \
-    echo "### Asserting go stale-goroutine-parent (0011) landed in vendored OBI" && \
-    grep -q "DisableGoStaleParent" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0011 config field missing from vendored OBI" && exit 1) && \
-    grep -q "disable_go_stale_parent" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0011 loader wiring missing from vendored OBI" && exit 1) && \
-    echo "### Asserting tp-reuse-breaker (0012) landed in vendored OBI" && \
-    grep -q "TPReuseThreshold" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0012 config field missing from vendored OBI" && exit 1) && \
-    grep -q "tp_reuse_threshold" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/generictracer.go || (echo "FATAL: 0012 generictracer wiring missing from vendored OBI" && exit 1) && \
-    grep -q "tp_reuse_threshold" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0012 gotracer wiring missing from vendored OBI" && exit 1) && \
-    echo "### Asserting trace-reuse-breaker (0013) landed in vendored OBI" && \
-    grep -q "TraceReuseThreshold" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0013 config field missing from vendored OBI" && exit 1) && \
-    grep -q "trace_reuse_threshold" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/generictracer.go || (echo "FATAL: 0013 generictracer wiring missing from vendored OBI" && exit 1) && \
-    grep -q "trace_reuse_threshold" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0013 gotracer wiring missing from vendored OBI" && exit 1) \
+    make copy-obi-vendor \
     ; fi
 
 # The Java agent is embedded at Go compile time, so the platform-specific jar
