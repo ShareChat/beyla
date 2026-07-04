@@ -1,8 +1,8 @@
 diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
-index 1a94624..7a3a031 100644
+index 68e27f5..d82622a 100644
 --- a/bpf/generictracer/protocol_http.h
 +++ b/bpf/generictracer/protocol_http.h
-@@ -602,6 +602,8 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
+@@ -840,6 +840,8 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
      if (tp_p && tp_p->req_type == EVENT_HTTP_CLIENT && tp_p->written &&
          tp_p->pid == args->pid_conn.pid) {
          bpf_dbg_printk("found tp info previously set by sock msg");
@@ -11,7 +11,7 @@ index 1a94624..7a3a031 100644
          // we've already got a tp_info_pid_t setup by the sockmsg program, use
          // that instead
          set_trace_info_for_connection(&args->pid_conn.conn, TRACE_TYPE_CLIENT, tp_p);
-@@ -610,6 +612,9 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
+@@ -848,6 +850,9 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
          goto skip_tp;
      }
  

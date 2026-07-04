@@ -106,6 +106,7 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     export BPF_CLANG=clang-22 && \
     export BPF_CFLAGS="-O2 -g -Wall -Werror" && \
     make generate && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0004-large-header-traceparent-scan-v324.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0001-debug-stitch-markers-STOCK.patch ) && \
     echo "### STOCK CONTROL: only debug markers, no ShareChat stack" && \
     grep -q "STITCHDBG" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: stock debug marker missing" && exit 1) && \
