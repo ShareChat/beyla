@@ -86,7 +86,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "custom-beyla-v3.24.0-tracecap"
+    imagetags  = "custom-beyla-v3.24.0-origlog"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }
@@ -97,6 +97,7 @@ spec:
         anyOf {
           branch 'tphdr-clean-base'
           branch 'tphdr-0012-tp-reuse-breaker'
+          branch 'originator-log'
           branch 'tphdr-debug-logging'
           branch 'master'
         }
@@ -122,6 +123,7 @@ spec:
         anyOf {
           branch 'tphdr-clean-base'
           branch 'tphdr-0012-tp-reuse-breaker'
+          branch 'originator-log'
           branch 'tphdr-debug-logging'
           branch 'master'
         }

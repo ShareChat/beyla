@@ -1,0 +1,61 @@
+diff --git a/pkg/ebpf/common/common.go b/pkg/ebpf/common/common.go
+index 1e5a78a..24825ea 100644
+--- a/pkg/ebpf/common/common.go
++++ b/pkg/ebpf/common/common.go
+@@ -13,6 +13,7 @@ import (
+ 	"log/slog"
+ 	"net"
+ 	"os"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -456,6 +457,48 @@ func (ctx *EBPFParseContext) finalizeSpans(spans []request.Span) {
+ 
+ 	for i := range spans {
+ 		ctx.consumePendingSpanLinks(&spans[i])
++		trackOriginator(&spans[i])
++	}
++}
++
++// ShareChat originator-hunt: emitted at ERROR level so operators can set
++// BEYLA_LOG_LEVEL=error and see ONLY this line (no info/debug noise). Counts, per
++// beyla pod (i.e. per node), how many spans land under each trace id; when a trace
++// id crosses OTEL_EBPF_BPF_ORIGINATOR_LOG_THRESHOLD it logs once, naming the local
++// service accumulating under it. Grep a hot trace_id across nodes to reconstruct
++// the propagation chain and find the reuse originator. Default 0 = disabled.
++var originatorLogThreshold = func() int {
++	if v, err := strconv.Atoi(os.Getenv("OTEL_EBPF_BPF_ORIGINATOR_LOG_THRESHOLD")); err == nil {
++		return v
++	}
++	return 0
++}()
++
++var (
++	originatorMu    sync.Mutex
++	originatorCount = map[string]int{}
++)
++
++func trackOriginator(s *request.Span) {
++	if originatorLogThreshold <= 0 || !s.TraceID.IsValid() {
++		return
++	}
++	tid := s.TraceID.String()
++	originatorMu.Lock()
++	if len(originatorCount) > 300000 { // crude cap; reset rather than grow unbounded
++		originatorCount = make(map[string]int, 4096)
++	}
++	originatorCount[tid]++
++	n := originatorCount[tid]
++	originatorMu.Unlock()
++	if n == originatorLogThreshold { // log exactly once, at the crossing
++		slog.Error("BEYLA_ORIGINATOR trace reuse crossed threshold",
++			"trace_id", tid,
++			"service", s.Service.UID.Name,
++			"namespace", s.Service.UID.Namespace,
++			"span_kind", s.Type.String(),
++			"path", s.Path,
++			"count", n)
+ 	}
+ }
+ 
