@@ -1,0 +1,129 @@
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index f928ac1..08a3557 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -36,6 +36,20 @@ volatile const u32 disable_client_thread_bind;
+ // trace instead. Off by default; only affects the Go uprobe tracer.
+ volatile const u32 disable_go_stale_parent;
+ 
++// 0017 (R0+R1): strict per-request parent resolution for the Go tracer.
++// R0: an ANCESTOR goroutine's go_trace_map entry may only be adopted while that
++// ancestor is inside a LIVE in-flight server invocation (present in
++// ongoing_http_server_requests / ongoing_grpc_server_requests). A leaked entry
++// on a long-lived goroutine (conn-serving goroutine, pooled transport
++// goroutine, missed handler-return) is skipped and the climb continues; if no
++// live ancestor exists the caller mints a FRESH trace. Deterministic and
++// timeout-free: a synchronous handler's outbound calls still parent correctly
++// (the handler IS live), while stale adoption becomes impossible by
++// construction (reverse-proxy/pooled-transport mega-trace class).
++// R1: on runtime.casgstatus -> g_dead, the dying goroutine's go_trace_map and
++// ongoing_goroutines entries are deleted (dead goroutines can't own requests).
++volatile const u32 go_strict_parent;
++
+ // ShareChat reuse-breaker threshold. 0 = disabled. When an incoming parent span
+ // id has been adopted by more than this many server requests, callers mint a
+ // fresh root instead of adopting (bounds unbounded trace-context reuse).
+diff --git a/bpf/gotracer/go_common.h b/bpf/gotracer/go_common.h
+index bd138db..28d91ec 100644
+--- a/bpf/gotracer/go_common.h
++++ b/bpf/gotracer/go_common.h
+@@ -30,6 +30,8 @@
+ #include <gotracer/go_offsets.h>
+ 
+ #include <gotracer/maps/handled_by_go.h>
++#include <gotracer/maps/nethttp.h>
++#include <gotracer/maps/grpc.h>
+ 
+ #include <logger/bpf_dbg.h>
+ 
+@@ -174,6 +176,26 @@ static __always_inline u64 find_parent_goroutine(go_addr_key_t *current) {
+                 break;
+             }
+         } else {
++            // 0017/R0: in strict mode an ANCESTOR's context (attempts > 0; the
++            // goroutine's OWN entry is always trusted) is adopted only while
++            // that ancestor has a live in-flight server invocation. A stale
++            // leaked entry on a long-lived goroutine is skipped and the climb
++            // continues; running out of ancestry returns 0 and the caller
++            // mints a fresh trace id.
++            if (go_strict_parent && attempts > 0 &&
++                !bpf_map_lookup_elem(&ongoing_http_server_requests, parent) &&
++                !bpf_map_lookup_elem(&ongoing_grpc_server_requests, parent)) {
++                bpf_dbg_printk("0017: skipping non-live ancestor ctx, r_addr=%lx", r_addr);
++                goroutine_metadata *g_metadata =
++                    (goroutine_metadata *)bpf_map_lookup_elem(&ongoing_goroutines, parent);
++                if (!g_metadata) {
++                    break;
++                }
++                r_addr = g_metadata->parent.addr;
++                parent = &g_metadata->parent;
++                attempts++;
++                continue;
++            }
+             bpf_dbg_printk("Found parent, r_addr=%lx", r_addr);
+             return r_addr;
+         }
+diff --git a/bpf/gotracer/go_runtime.c b/bpf/gotracer/go_runtime.c
+index 4926cd5..a8d5ac8 100644
+--- a/bpf/gotracer/go_runtime.c
++++ b/bpf/gotracer/go_runtime.c
+@@ -670,6 +670,17 @@ int obi_uprobe_runtime_casgstatus(struct pt_regs *ctx) {
+             return 0;
+         }
+ 
++        break;
++    case g_dead:
++        // 0017/R1: the goroutine is gone; a dead goroutine cannot own a
++        // request, so its trace context must not remain adoptable by the
++        // ancestry climb. Only g_dead — NOT the default branch, which also
++        // catches g_waiting (normal blocking) where the context is still live.
++        if (go_strict_parent) {
++            bpf_map_delete_elem(&go_trace_map, &g_key);
++            bpf_map_delete_elem(&ongoing_goroutines, &g_key);
++        }
++        obi_ctx__del(g_pid_tgid);
+         break;
+     default:
+         obi_ctx__del(g_pid_tgid);
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index 4e148f8..da496e8 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -120,6 +120,14 @@ type EBPFTracer struct {
+ 	// into one unbounded trace. Off by default; only affects the Go uprobe tracer.
+ 	DisableGoStaleParent bool `yaml:"disable_go_stale_parent" env:"OTEL_EBPF_BPF_DISABLE_GO_STALE_PARENT" validate:"boolean"`
+ 
++	// Strict per-request parent resolution for the Go tracer (R0+R1). An
++	// ancestor goroutine's trace context is only adopted while that ancestor
++	// has a live in-flight server invocation; otherwise the client call mints
++	// a fresh trace. Also deletes a goroutine's trace context when it dies.
++	// Deterministic, timeout-free; async fan-out via dead/idle ancestors is
++	// intentionally NOT inherited when enabled.
++	GoStrictParent bool `yaml:"go_strict_parent" env:"OTEL_EBPF_BPF_GO_STRICT_PARENT" validate:"boolean"`
++
+ 	// ShareChat reuse-breaker: 0 disables. When an incoming traceparent's parent
+ 	// span has been adopted by more than this many server requests, OBI mints a
+ 	// fresh root instead of adopting it (bounds unbounded trace-context reuse).
+diff --git a/pkg/internal/ebpf/gotracer/gotracer.go b/pkg/internal/ebpf/gotracer/gotracer.go
+index 43b23bc..f0ab60d 100644
+--- a/pkg/internal/ebpf/gotracer/gotracer.go
++++ b/pkg/internal/ebpf/gotracer/gotracer.go
+@@ -137,12 +137,18 @@ func (p *Tracer) constants() map[string]any {
+ 		goStaleParent = uint32(1)
+ 	}
+ 
++	goStrictParent := uint32(0)
++	if p.cfg.GoStrictParent {
++		goStrictParent = uint32(1)
++	}
++
+ 	m := map[string]any{
+ 		"g_bpf_debug":               p.cfg.BpfDebug,
+ 		"g_bpf_header_propagation":  p.supportsContextPropagation(),
+ 		"wakeup_data_bytes":         uint32(p.cfg.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{})),
+ 		"disable_black_box_cp":      blackBoxCP,
+ 		"disable_go_stale_parent":   goStaleParent,
++		"go_strict_parent":          goStrictParent,
+ 		"tp_reuse_threshold":        p.cfg.TPReuseThreshold,
+ 		"trace_reuse_threshold":     p.cfg.TraceReuseThreshold,
+ 		"attr_type_invalid":         uint64(attribute.INVALID),
