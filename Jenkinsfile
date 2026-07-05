@@ -86,7 +86,7 @@ spec:
   environment {
     sc_regions = "mumbai"
     app        = "beyla-custom"
-    imagetags  = "beya-4-patch"
+    imagetags  = "beya-5-patch"
     buildarg_DEPLOYMENT_ID = "beyla-custom-$GIT_COMMIT"
     buildarg_BUILDARCH     = "amd64"
   }

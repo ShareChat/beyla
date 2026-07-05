@@ -1,0 +1,176 @@
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index 2c7f398..c8d8f60 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -9,6 +9,7 @@
+ #include <common/trace_util.h>
+ 
+ #include <maps/tp_reuse_count.h>
++#include <maps/trace_reuse_count.h>
+ #include <maps/trace_map.h>
+ 
+ #define NANOSECONDS_PER_EPOCH (15LL * 1000000000LL) // 15 seconds
+@@ -104,6 +105,32 @@ static __always_inline u8 tp_reuse_should_break(const unsigned char *parent_id)
+     return newcnt > tp_reuse_threshold;
+ }
+ 
++// beya-5-patch / 0008 (0013 port, prod-validated): trace-id reuse breaker.
++// 0 = disabled. When a single TRACE id has anchored more than this many server
++// requests, receivers mint a fresh root instead of adopting (bounds mesh-cycle
++// mega-traces whose parent span id rotates per hop, which the per-parent
++// tp_reuse_threshold cannot see). Legit large traces can span many services,
++// so this should sit well above tp_reuse_threshold (e.g. 256-1024).
++// Set from Go via OTEL_EBPF_BPF_TRACE_REUSE_THRESHOLD.
++volatile const u32 trace_reuse_threshold;
++
++// Returns 1 if this incoming TRACE id has already anchored more than
++// trace_reuse_threshold server requests. Request-count based, not time based.
++static __always_inline u8 trace_reuse_should_break(const unsigned char *trace_id) {
++    if (trace_reuse_threshold == 0) {
++        return 0; // feature disabled
++    }
++    u64 key = 0;
++    __builtin_memcpy(&key, trace_id, sizeof(key)); // first 8 bytes of trace id
++    if (key == 0) {
++        return 0; // invalid/absent trace id - nothing to break
++    }
++    u32 *cnt = bpf_map_lookup_elem(&trace_reuse_count, &key);
++    u32 newcnt = cnt ? (*cnt + 1) : 1;
++    bpf_map_update_elem(&trace_reuse_count, &key, &newcnt, BPF_ANY);
++    return newcnt > trace_reuse_threshold;
++}
++
+ #define TRACE_TYPE_SERVER 1
+ #define TRACE_TYPE_CLIENT 2
+ 
+diff --git a/bpf/generictracer/protocol_handler.c b/bpf/generictracer/protocol_handler.c
+index 86a7993..5ce38b3 100644
+--- a/bpf/generictracer/protocol_handler.c
++++ b/bpf/generictracer/protocol_handler.c
+@@ -128,7 +128,8 @@ int obi_handle_buf_with_args(void *ctx) {
+                         decode_hex(info->tp.parent_id, s_id, SPAN_ID_CHAR_LEN);
+                         // 0007: split-packet traceparent pickup is a server
+                         // adoption site too - same guard as the scans.
+-                        if (tp_reuse_should_break(info->tp.parent_id)) {
++                        if (tp_reuse_should_break(info->tp.parent_id) ||
++                            trace_reuse_should_break(info->tp.trace_id)) {
+                             new_trace_id(&info->tp);
+                             __builtin_memset(info->tp.parent_id, 0, sizeof(info->tp.parent_id));
+                         }
+diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
+index ef8956a..5cd2df3 100644
+--- a/bpf/generictracer/protocol_http.h
++++ b/bpf/generictracer/protocol_http.h
+@@ -559,7 +559,8 @@ static __always_inline enum tp_scan_result __tp_chunk_scan(call_protocol_args_t
+             decode_hex(tp_p->tp.parent_id, s_id, SPAN_ID_CHAR_LEN);
+             // 0007: a traceparent found via the chunked rescan must not
+             // bypass the reuse guard.
+-            if (tp_reuse_should_break(tp_p->tp.parent_id)) {
++            if (tp_reuse_should_break(tp_p->tp.parent_id) ||
++                trace_reuse_should_break(tp_p->tp.trace_id)) {
+                 new_trace_id(&tp_p->tp);
+                 __builtin_memset(tp_p->tp.parent_id, 0, sizeof(tp_p->tp.parent_id));
+             }
+@@ -750,7 +751,8 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
+                     decode_hex(tp_p->tp.parent_id, s_id, SPAN_ID_CHAR_LEN);
+                     // 0007: if this incoming parent span has anchored too many
+                     // server requests, mint a fresh root instead of adopting.
+-                    if (tp_reuse_should_break(tp_p->tp.parent_id)) {
++                    if (tp_reuse_should_break(tp_p->tp.parent_id) ||
++                        trace_reuse_should_break(tp_p->tp.trace_id)) {
+                         new_trace_id(&tp_p->tp);
+                         __builtin_memset(tp_p->tp.parent_id, 0, sizeof(tp_p->tp.parent_id));
+                     }
+diff --git a/bpf/generictracer/protocol_http2.h b/bpf/generictracer/protocol_http2.h
+index a682f72..1d2a635 100644
+--- a/bpf/generictracer/protocol_http2.h
++++ b/bpf/generictracer/protocol_http2.h
+@@ -144,7 +144,8 @@ static __always_inline void http2_grpc_start_finalize_server(http2_conn_stream_t
+                                                              u16 orig_dport) {
+     // 0007: if the adopted parent span has anchored too many server requests,
+     // drop the adoption and start a fresh root.
+-    if (found_tp && tp_reuse_should_break(tp_p->tp.parent_id)) {
++    if (found_tp && (tp_reuse_should_break(tp_p->tp.parent_id) ||
++                     trace_reuse_should_break(tp_p->tp.trace_id))) {
+         found_tp = 0;
+     }
+     if (!found_tp) {
+diff --git a/bpf/gotracer/go_grpc.c b/bpf/gotracer/go_grpc.c
+index e6ed61f..7ce6081 100644
+--- a/bpf/gotracer/go_grpc.c
++++ b/bpf/gotracer/go_grpc.c
+@@ -158,7 +158,8 @@ int obi_uprobe_http2Server_operateHeaders(struct pt_regs *ctx) {
+     // 0007: gRPC server adoption site. An incoming traceparent whose parent
+     // span id has anchored too many server requests is invalidated here, so
+     // server_trace_parent generates a fresh trace instead of adopting.
+-    if (valid_trace(t.tp.trace_id) && tp_reuse_should_break(t.tp.parent_id)) {
++    if (valid_trace(t.tp.trace_id) &&
++        (tp_reuse_should_break(t.tp.parent_id) || trace_reuse_should_break(t.tp.trace_id))) {
+         __builtin_memset(&t.tp, 0, sizeof(t.tp));
+     }
+ 
+diff --git a/bpf/gotracer/go_nethttp.c b/bpf/gotracer/go_nethttp.c
+index f4e7de7..9f791e4 100644
+--- a/bpf/gotracer/go_nethttp.c
++++ b/bpf/gotracer/go_nethttp.c
+@@ -369,7 +369,8 @@ static __always_inline void handle_traceparent_header(server_http_func_invocatio
+         if (!valid_trace(inv->tp.trace_id)) {
+             update_traceparent(inv, traceparent_start);
+             // 0007: bound reuse of an adopted parent span.
+-            if (tp_reuse_should_break(inv->tp.parent_id)) {
++            if (tp_reuse_should_break(inv->tp.parent_id) ||
++                trace_reuse_should_break(inv->tp.trace_id)) {
+                 new_trace_id(&inv->tp);
+                 __builtin_memset(inv->tp.parent_id, 0, sizeof(inv->tp.parent_id));
+             }
+@@ -377,7 +378,8 @@ static __always_inline void handle_traceparent_header(server_http_func_invocatio
+     } else {
+         server_http_func_invocation_t minimal_inv = {0};
+         update_traceparent(&minimal_inv, traceparent_start);
+-        if (tp_reuse_should_break(minimal_inv.tp.parent_id)) {
++        if (tp_reuse_should_break(minimal_inv.tp.parent_id) ||
++            trace_reuse_should_break(minimal_inv.tp.trace_id)) {
+             new_trace_id(&minimal_inv.tp);
+             __builtin_memset(minimal_inv.tp.parent_id, 0, sizeof(minimal_inv.tp.parent_id));
+         }
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index c084d3d..240f007 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -118,6 +118,12 @@ type EBPFTracer struct {
+ 	// fresh root instead of adopting it (bounds unbounded trace-context reuse).
+ 	TPReuseThreshold uint32 `yaml:"tp_reuse_threshold" env:"OTEL_EBPF_BPF_TP_REUSE_THRESHOLD"`
+ 
++	// ShareChat trace-reuse-breaker: 0 disables. When a single trace id has been
++	// adopted by more than this many server requests, OBI mints a fresh root
++	// instead of adopting (bounds mesh-cycle mega-traces with rotating parent
++	// ids). Should be set well above tp_reuse_threshold (e.g. 256-1024).
++	TraceReuseThreshold uint32 `yaml:"trace_reuse_threshold" env:"OTEL_EBPF_BPF_TRACE_REUSE_THRESHOLD"`
++
+ 	HighRequestVolume bool `yaml:"high_request_volume" env:"OTEL_EBPF_BPF_HIGH_REQUEST_VOLUME" validate:"boolean"`
+ 
+ 	// Enables the heuristic based detection of SQL requests. This can be used to detect
+diff --git a/pkg/internal/ebpf/generictracer/generictracer.go b/pkg/internal/ebpf/generictracer/generictracer.go
+index 086deef..fc8ea07 100644
+--- a/pkg/internal/ebpf/generictracer/generictracer.go
++++ b/pkg/internal/ebpf/generictracer/generictracer.go
+@@ -232,6 +232,7 @@ func (p *Tracer) constants() map[string]any {
+ 
+ 	m["client_reuse_threshold"] = p.cfg.EBPF.ClientReuseThreshold
+ 	m["tp_reuse_threshold"] = p.cfg.EBPF.TPReuseThreshold
++	m["trace_reuse_threshold"] = p.cfg.EBPF.TraceReuseThreshold
+ 
+ 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
+ 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
+diff --git a/pkg/internal/ebpf/gotracer/gotracer.go b/pkg/internal/ebpf/gotracer/gotracer.go
+index d88773c..ab0a39b 100644
+--- a/pkg/internal/ebpf/gotracer/gotracer.go
++++ b/pkg/internal/ebpf/gotracer/gotracer.go
+@@ -141,6 +141,7 @@ func (p *Tracer) constants() map[string]any {
+ 		"go_strict_parent":          goStrictParent,
+ 		"client_reuse_threshold":    p.cfg.ClientReuseThreshold,
+ 		"tp_reuse_threshold":        p.cfg.TPReuseThreshold,
++		"trace_reuse_threshold":     p.cfg.TraceReuseThreshold,
+ 		"g_bpf_debug":               p.cfg.BpfDebug,
+ 		"g_bpf_header_propagation":  p.supportsContextPropagation(),
+ 		"wakeup_data_bytes":         uint32(p.cfg.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{})),
