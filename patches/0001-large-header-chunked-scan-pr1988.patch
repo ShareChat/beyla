@@ -281,7 +281,7 @@ index 03ce2a7..9744a65 100644
                      info->end_monotime_ns = bpf_ktime_get_ns();
                      bpf_d_printk("bytes len %d, new bytes %d", info->resp_len, args->bytes_len);
 diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
-index 1a94624..89f63dd 100644
+index 1a94624..c45c452 100644
 --- a/bpf/generictracer/protocol_http.h
 +++ b/bpf/generictracer/protocol_http.h
 @@ -40,6 +40,16 @@ volatile const u32 high_request_volume;
@@ -301,7 +301,7 @@ index 1a94624..89f63dd 100644
  // empty_http_info zeroes and return the unique percpu copy in the map
  // this function assumes that a given thread is not trying to use many
  // instances at the same time
-@@ -453,6 +463,225 @@ int obi_continue2_protocol_http(struct pt_regs *ctx) {
+@@ -453,6 +463,221 @@ int obi_continue2_protocol_http(struct pt_regs *ctx) {
      return __obi_continue2_protocol_http(ctx, args, info, meta);
  }
  
@@ -487,9 +487,7 @@ index 1a94624..89f63dd 100644
 +    http_connection_metadata_t *meta =
 +        connection_meta_by_direction(args->direction, PACKET_TYPE_REQUEST);
 +    if (!meta) {
-+        http_send_large_buffer(ctx,
-+                               info,
-+                               &args->pid_conn,
++        http_send_large_buffer(info,
 +                               (void *)args->u_buf,
 +                               args->bytes_len,
 +                               args->packet_type,
@@ -513,9 +511,7 @@ index 1a94624..89f63dd 100644
 +        bpf_dbg_printk(
 +            "obi_parse_traceparent_http_append: trace_info_for_connection() returned NULL");
 +    }
-+    http_send_large_buffer(ctx,
-+                           info,
-+                           &args->pid_conn,
++    http_send_large_buffer(info,
 +                           (void *)args->u_buf,
 +                           args->bytes_len,
 +                           args->packet_type,
@@ -527,7 +523,7 @@ index 1a94624..89f63dd 100644
  static __always_inline int
  __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                                  call_protocol_args_t *args,
-@@ -530,6 +759,15 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
+@@ -530,6 +755,15 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                  }
              } else {
                  bpf_dbg_printk("No additional traceparent in headers, using what was made before");
@@ -543,7 +539,7 @@ index 1a94624..89f63dd 100644
              }
          } else {
              goto done;
-@@ -793,7 +1031,17 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
+@@ -793,7 +1027,17 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
                                 args->direction,
                                 k_large_buf_action_append);
  
