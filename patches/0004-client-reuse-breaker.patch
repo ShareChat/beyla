@@ -1,0 +1,103 @@
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index d6df1a4..bbdfb9f 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -27,6 +27,49 @@ volatile const u32 disable_black_box_cp;
+ // Set via OTEL_EBPF_BPF_GO_STRICT_PARENT.
+ volatile const u32 go_strict_parent;
+ 
++// beya-3-patch / 0004: client-side adoption reuse-breaker. Bounds how many
++// client spans may adopt the SAME parent span context. Under concurrent load
++// every outbound call on a pod can parent under whichever server request is
++// currently live (goroutine ancestry resolves to a connection/pool goroutine
++// spawned during that request), welding many unrelated requests' calls into
++// one trace (staging /call-h2-burst: 257 client spans / 1 parent = ~15
++// requests merged). The liveness gate (0002) passes by design - the anchor IS
++// live - and the HPACK gate (0003) sits downstream of span identity. Counting
++// adoptions per parent span id is deterministic and mechanism-agnostic:
++// legitimate fan-out survives a threshold comfortably above per-request call
++// counts (e.g. 32-64); unbounded welds break and mint fresh traces.
++// 0 = disabled. Set via OTEL_EBPF_BPF_CLIENT_REUSE_THRESHOLD.
++volatile const u32 client_reuse_threshold;
++
++// Count of client spans that adopted a given parent span context, keyed on
++// the first 8 bytes of the parent span id. LRU bounds memory and evicts cold
++// anchors.
++struct {
++    __uint(type, BPF_MAP_TYPE_LRU_HASH);
++    __type(key, u64);   // first 8 bytes of the adopted parent span id
++    __type(value, u32); // number of client spans that adopted this parent
++    __uint(max_entries, 65536);
++} client_reuse_count SEC(".maps");
++
++// Returns true when this adoption would put the parent span id past
++// client_reuse_threshold adopting client spans. Request-count based, not time
++// based.
++static __always_inline u8 client_reuse_should_break(const tp_info_t *parent_tp) {
++    if (client_reuse_threshold == 0) {
++        return 0;
++    }
++    u64 parent_key = *((const u64 *)parent_tp->span_id);
++    u32 *cnt = bpf_map_lookup_elem(&client_reuse_count, &parent_key);
++    if (!cnt) {
++        u32 one = 1;
++        bpf_map_update_elem(&client_reuse_count, &parent_key, &one, BPF_ANY);
++        return 0;
++    }
++    u32 newcnt = *cnt + 1;
++    bpf_map_update_elem(&client_reuse_count, &parent_key, &newcnt, BPF_ANY);
++    return newcnt > client_reuse_threshold;
++}
++
+ #define TRACE_TYPE_SERVER 1
+ #define TRACE_TYPE_CLIENT 2
+ 
+diff --git a/bpf/gotracer/go_common.h b/bpf/gotracer/go_common.h
+index f578fff..eb033be 100644
+--- a/bpf/gotracer/go_common.h
++++ b/bpf/gotracer/go_common.h
+@@ -350,6 +350,13 @@ static __always_inline u8 client_trace_parent(void *goroutine_addr, tp_info_t *t
+     if (!found_trace_id) {
+         tp_info_t *tp = tp_info_from_parent_go(&g_key, 0);
+ 
++        // 0004: bound how many client spans may adopt one parent context.
++        // Past the threshold this parent is a weld anchor, not a request.
++        if (tp && client_reuse_should_break(tp)) {
++            bpf_dbg_printk("0004: parent ctx past client reuse threshold, minting fresh");
++            tp = 0;
++        }
++
+         if (tp) {
+             tp_from_parent(tp_i, tp);
+         } else {
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index fcde994..eb73f00 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -105,6 +105,14 @@ type EBPFTracer struct {
+ 	// traceparent (exclude_otel_instrumented_services=true).
+ 	DisableH2TpAdopt bool `yaml:"disable_h2_tp_adopt" env:"OTEL_EBPF_BPF_DISABLE_H2_TP_ADOPT" validate:"boolean"`
+ 
++	// Client-side adoption reuse-breaker: 0 disables. When more than this many
++	// client spans have adopted the same parent span context, the Go tracer
++	// mints a fresh trace instead of adopting (bounds live-anchor welds where
++	// every outbound call on a connection/pool goroutine parents under
++	// whichever server request is currently in flight). Set comfortably above
++	// legitimate per-request fan-out (e.g. 32-64).
++	ClientReuseThreshold uint32 `yaml:"client_reuse_threshold" env:"OTEL_EBPF_BPF_CLIENT_REUSE_THRESHOLD"`
++
+ 	HighRequestVolume bool `yaml:"high_request_volume" env:"OTEL_EBPF_BPF_HIGH_REQUEST_VOLUME" validate:"boolean"`
+ 
+ 	// Enables the heuristic based detection of SQL requests. This can be used to detect
+diff --git a/pkg/internal/ebpf/gotracer/gotracer.go b/pkg/internal/ebpf/gotracer/gotracer.go
+index fe92d8f..66812b7 100644
+--- a/pkg/internal/ebpf/gotracer/gotracer.go
++++ b/pkg/internal/ebpf/gotracer/gotracer.go
+@@ -139,6 +139,7 @@ func (p *Tracer) constants() map[string]any {
+ 
+ 	m := map[string]any{
+ 		"go_strict_parent":          goStrictParent,
++		"client_reuse_threshold":    p.cfg.ClientReuseThreshold,
+ 		"g_bpf_debug":               p.cfg.BpfDebug,
+ 		"g_bpf_header_propagation":  p.supportsContextPropagation(),
+ 		"wakeup_data_bytes":         uint32(p.cfg.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{})),
