@@ -1,0 +1,77 @@
+diff --git a/bpf/tpinjector/tpinjector.c b/bpf/tpinjector/tpinjector.c
+index 963586d..92ac8bb 100644
+--- a/bpf/tpinjector/tpinjector.c
++++ b/bpf/tpinjector/tpinjector.c
+@@ -96,6 +96,15 @@ enum {
+ volatile const u32 inject_flags =
+     k_inject_http_headers | k_inject_tcp_options; // default: both enabled
+ 
++// 0010: when set, the H2 injector does NOT adopt a traceparent already present in
++// the outgoing HPACK headers. grpc-go caches Beyla's own injected traceparent in
++// the HTTP/2 HPACK dynamic table and replays it (indexed) on subsequent streams;
++// adopting that replayed value merges every multiplexed stream into one trace_id
++// (the network-relevance/ads-dnb mega-trace). Instead we mint a fresh tp per
++// stream. Safe when instrumented apps don't set their own traceparent
++// (exclude_otel_instrumented_services=true), which is our production case.
++volatile const u32 disable_h2_tp_adopt;
++
+ // Kind 25 is unassigned per IANA TCP Parameters registry (released 2000-12-18)
+ // Better than experimental options (253-254) which must not be shipped as defaults
+ enum { k_tcp_option_kind_otel = 25 };
+@@ -1419,6 +1428,15 @@ int obi_packet_extender_validate_h2_tp(struct sk_msg_md *msg) {
+     }
+ 
+     if (off) {
++        // 0010: the traceparent we just found in the outgoing HPACK is almost
++        // certainly grpc-go replaying Beyla's own injected value from the dynamic
++        // table. Adopting it makes every multiplexed stream share one trace_id.
++        // Skip adoption and mint a fresh tp per stream instead.
++        if (disable_h2_tp_adopt) {
++            bpf_dbg_printk("0010: ignoring HPACK-replayed traceparent, minting fresh per stream");
++            bpf_tail_call_static(msg, &extender_jump_table, k_tail_create_h2_tp);
++            return SK_PASS;
++        }
+         init_tp_ctx_parent_tp(t_ctx);
+         bpf_memset(tp_p->tp.parent_id, 0, sizeof(tp_p->tp.parent_id));
+         const u32 span_id_offset = hpack_start + target + off;
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index 806b30d..fcde994 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -97,6 +97,14 @@ type EBPFTracer struct {
+ 	// invocation; otherwise mint a fresh trace. Deterministic, timeout-free.
+ 	GoStrictParent bool `yaml:"go_strict_parent" env:"OTEL_EBPF_BPF_GO_STRICT_PARENT" validate:"boolean"`
+ 
++	// Disables the H2 injector adopting a traceparent already present in outgoing
++	// HPACK headers. grpc-go replays Beyla's own injected traceparent via the HPACK
++	// dynamic table across multiplexed streams; adopting it merges every stream on
++	// the connection into one trace (100-200-request welds). When set, mints a
++	// fresh tp per stream instead. Safe when instrumented apps don't set their own
++	// traceparent (exclude_otel_instrumented_services=true).
++	DisableH2TpAdopt bool `yaml:"disable_h2_tp_adopt" env:"OTEL_EBPF_BPF_DISABLE_H2_TP_ADOPT" validate:"boolean"`
++
+ 	HighRequestVolume bool `yaml:"high_request_volume" env:"OTEL_EBPF_BPF_HIGH_REQUEST_VOLUME" validate:"boolean"`
+ 
+ 	// Enables the heuristic based detection of SQL requests. This can be used to detect
+diff --git a/pkg/internal/ebpf/tpinjector/tpinjector.go b/pkg/internal/ebpf/tpinjector/tpinjector.go
+index 61ada3f..1946e64 100644
+--- a/pkg/internal/ebpf/tpinjector/tpinjector.go
++++ b/pkg/internal/ebpf/tpinjector/tpinjector.go
+@@ -92,11 +92,17 @@ func (p *Tracer) constants() map[string]any {
+ 		filterPids = 0
+ 	}
+ 
++	disableH2TpAdopt := uint32(0)
++	if p.cfg.EBPF.DisableH2TpAdopt {
++		disableH2TpAdopt = 1
++	}
++
+ 	return map[string]any{
+ 		"filter_pids":          filterPids,
+ 		"max_transaction_time": uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
+ 		"inject_flags":         flags,
+ 		"g_bpf_debug":          p.cfg.EBPF.BpfDebug,
++		"disable_h2_tp_adopt":  disableH2TpAdopt,
+ 	}
+ }
+ 

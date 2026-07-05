@@ -108,6 +108,7 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     make generate && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0001-large-header-chunked-scan-pr1988.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0002-go-strict-parent-liveness.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0003-disable-h2-tp-adopt.patch ) && \
     echo "### Asserting beya-1-patch content applied to eBPF C before generate" && \
     grep -q "k_tail_parse_traceparent_http_append" .obi-src/bpf/generictracer/k_tracer_tailcall.h || (echo "FATAL: 0001 chunked scanner enum missing" && exit 1) && \
     grep -q "bpf_max_request_tp_parse_size_kb" .obi-src/bpf/generictracer/protocol_http.h || (echo "FATAL: 0001 scan window missing from protocol_http.h" && exit 1) && \
@@ -115,6 +116,9 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     grep -q "0002: skipping non-live goroutine ctx" .obi-src/bpf/gotracer/go_common.h || (echo "FATAL: 0002 liveness gate missing from go_common.h" && exit 1) && \
     grep -q "case g_dead:" .obi-src/bpf/gotracer/go_runtime.c || (echo "FATAL: 0002 g_dead cleanup missing from go_runtime.c" && exit 1) && \
     grep -q "GoStrictParent" .obi-src/pkg/config/ebpf_tracer.go || (echo "FATAL: 0002 config field missing" && exit 1) && \
+    grep -q "disable_h2_tp_adopt" .obi-src/bpf/tpinjector/tpinjector.c || (echo "FATAL: 0003 h2 no-adopt guard missing from tpinjector.c" && exit 1) && \
+    grep -q "DisableH2TpAdopt" .obi-src/pkg/config/ebpf_tracer.go || (echo "FATAL: 0003 config field missing" && exit 1) && \
+    grep -q "disable_h2_tp_adopt" .obi-src/pkg/internal/ebpf/tpinjector/tpinjector.go || (echo "FATAL: 0003 loader wiring missing" && exit 1) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
     echo "### Asserting beya-1-patch wiring landed in vendored OBI" && \
