@@ -133,6 +133,28 @@ index f4e7de7..9f791e4 100644
              new_trace_id(&minimal_inv.tp);
              __builtin_memset(minimal_inv.tp.parent_id, 0, sizeof(minimal_inv.tp.parent_id));
          }
+diff --git a/bpf/maps/trace_reuse_count.h b/bpf/maps/trace_reuse_count.h
+new file mode 100644
+index 0000000..e3bc736
+--- /dev/null
++++ b/bpf/maps/trace_reuse_count.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include <bpfcore/vmlinux.h>
++#include <bpfcore/bpf_helpers.h>
++
++// ShareChat trace-reuse-breaker: counts how many server requests have adopted a
++// given incoming TRACE id (first 8 bytes). Bounds mesh-cycle mega-traces where
++// one trace id circulates between services via individually-legit hops with a
++// fresh parent span id each time (invisible to the per-parent tp_reuse_count).
++// LRU bounds memory and evicts cold trace ids.
++struct {
++    __uint(type, BPF_MAP_TYPE_LRU_HASH);
++    __type(key, u64);   // first 8 bytes of the incoming trace id
++    __type(value, u32); // number of server requests that adopted this trace id
++    __uint(max_entries, 65536);
++} trace_reuse_count SEC(".maps");
 diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
 index c084d3d..240f007 100644
 --- a/pkg/config/ebpf_tracer.go

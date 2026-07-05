@@ -147,6 +147,27 @@ index 5dcc201..f4e7de7 100644
          bpf_map_update_elem(&ongoing_http_server_requests, g_key, &minimal_inv, BPF_ANY);
          obi_ctx__set(bpf_get_current_pid_tgid(), &minimal_inv.tp);
      }
+diff --git a/bpf/maps/tp_reuse_count.h b/bpf/maps/tp_reuse_count.h
+new file mode 100644
+index 0000000..36d62e4
+--- /dev/null
++++ b/bpf/maps/tp_reuse_count.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <bpfcore/vmlinux.h>
++#include <bpfcore/bpf_helpers.h>
++
++// ShareChat reuse-breaker: counts how many server requests have adopted a given
++// incoming parent span id. Used to bound unbounded trace-context reuse
++// (a reused/sticky/looped parent merging thousands of requests into one trace).
++// LRU bounds memory and evicts cold anchors.
++struct {
++    __uint(type, BPF_MAP_TYPE_LRU_HASH);
++    __type(key, u64);   // first 8 bytes of the incoming parent span id
++    __type(value, u32); // number of server requests that adopted this parent
++    __uint(max_entries, 65536);
++} tp_reuse_count SEC(".maps");
 diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
 index eb73f00..c084d3d 100644
 --- a/pkg/config/ebpf_tracer.go
