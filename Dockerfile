@@ -110,6 +110,7 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0002-go-strict-parent-liveness.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0003-disable-h2-tp-adopt.patch ) && \
     ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0004-client-reuse-breaker.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0005-generic-client-reuse-breaker.patch ) && \
     echo "### Asserting beya-1-patch content applied to eBPF C before generate" && \
     grep -q "k_tail_parse_traceparent_http_append" .obi-src/bpf/generictracer/k_tracer_tailcall.h || (echo "FATAL: 0001 chunked scanner enum missing" && exit 1) && \
     grep -q "bpf_max_request_tp_parse_size_kb" .obi-src/bpf/generictracer/protocol_http.h || (echo "FATAL: 0001 scan window missing from protocol_http.h" && exit 1) && \
@@ -124,6 +125,9 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     grep -q "0004: parent ctx past client reuse threshold" .obi-src/bpf/gotracer/go_common.h || (echo "FATAL: 0004 breaker gate missing from go_common.h" && exit 1) && \
     grep -q "ClientReuseThreshold" .obi-src/pkg/config/ebpf_tracer.go || (echo "FATAL: 0004 config field missing" && exit 1) && \
     grep -q "client_reuse_threshold" .obi-src/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0004 loader wiring missing" && exit 1) && \
+    grep -q "client_reuse_should_break_key" .obi-src/bpf/common/tracing.h || (echo "FATAL: 0005 key-based breaker helper missing from tracing.h" && exit 1) && \
+    grep -q "0005: parent ctx past client reuse threshold" .obi-src/bpf/generictracer/protocol_http2.h || (echo "FATAL: 0005 breaker gate missing from protocol_http2.h" && exit 1) && \
+    grep -q "client_reuse_threshold" .obi-src/pkg/internal/ebpf/generictracer/generictracer.go || (echo "FATAL: 0005 generic loader wiring missing" && exit 1) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
     echo "### Asserting beya-1-patch wiring landed in vendored OBI" && \
@@ -131,7 +135,8 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     grep -q "GoStrictParent" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0002 config field missing from vendored OBI" && exit 1) && \
     grep -q "go_strict_parent" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0002 loader wiring missing from vendored OBI" && exit 1) && \
     grep -q "ClientReuseThreshold" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0004 config field missing from vendored OBI" && exit 1) && \
-    grep -q "client_reuse_threshold" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0004 loader wiring missing from vendored OBI" && exit 1) \
+    grep -q "client_reuse_threshold" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0004 loader wiring missing from vendored OBI" && exit 1) && \
+    grep -q "client_reuse_threshold" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/generictracer.go || (echo "FATAL: 0005 generic loader wiring missing from vendored OBI" && exit 1) \
     ; fi
 
 # The Java agent is embedded at Go compile time, so the platform-specific jar
