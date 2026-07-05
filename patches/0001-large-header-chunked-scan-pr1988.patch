@@ -1,0 +1,1253 @@
+diff --git a/SUPPORT_MATRIX.md b/SUPPORT_MATRIX.md
+index 6dd7f53..9b98853 100644
+--- a/SUPPORT_MATRIX.md
++++ b/SUPPORT_MATRIX.md
+@@ -60,7 +60,7 @@ through language-specific library instrumentation documented later in this file.
+ 
+ | Protocol | Versions | Methods or operations | Secure | Context propagation | Limitations |
+ |:---------|:---------|:----------------------|:------:|:-------------------:|:------------|
+-| HTTP | `1.0/1.1` | All | Yes | Yes | None documented |
++| HTTP | `1.0/1.1` | All | Yes | Yes | Chunked traceparent scanner (finding `traceparent` buried after large headers) requires kernel `5.17+` and context propagation or request header tracking to be enabled (`OTEL_EBPF_TRACK_REQUEST_HEADERS=true` or `OTEL_EBPF_CONTEXT_PROPAGATION=true`). On older kernels only the first ~1 KB is scanned. |
+ | HTTP | `2.0` | All | Yes | No | Context propagation for HTTP/2 is only through Go library instrumentation |
+ | gRPC | `1.0+` | All | Yes | No | Long-lived connections started before OBI may use `*` for method names |
+ | MySQL | All | All | Yes | No | Prepared statements created before OBI started may miss query text |
+diff --git a/bpf/common/http_types.h b/bpf/common/http_types.h
+index 3b2cb72..0939f24 100644
+--- a/bpf/common/http_types.h
++++ b/bpf/common/http_types.h
+@@ -52,12 +52,17 @@ typedef struct call_protocol_args {
+     u8 skip_tp_parsing;
+     u8 use_bpf_loop;
+     u8 pad[1];
++    u32 niter;
+     int bytes_len;
+     u16 orig_dport;
+-    u16 _pad2;
++    u8 u_buf_is_user;
++    u8 _pad_ubuf[5]; // align u_buf to 8 bytes (offset 88)
+     u64 u_buf;
+     u64 self_ref_parent_id;
+     lw_thread_t lw_thread;
++    u64 orig_buf;
++    u32 full_bytes_len; // pre-truncation recv length; only used when orig_buf is set
++    u32 _pad2;
+ } call_protocol_args_t;
+ 
+ // Here we keep information on the packets passing through the socket filter
+diff --git a/bpf/common/trace_util.h b/bpf/common/trace_util.h
+index fbbdcce..7c70892 100644
+--- a/bpf/common/trace_util.h
++++ b/bpf/common/trace_util.h
+@@ -110,6 +110,62 @@ static __always_inline u32 traceparent_scan_loop_count(const u16 buf_len) {
+     return min((u32)buf_len - TRACE_PARENT_HEADER_LEN + 1, k_tp_max_scan_loops);
+ }
+ 
++struct callback_ctx_eoh {
++    unsigned char *buf;
++    u32 tp_pos;
++    u32 eoh_pos;
++};
++
++// The guard uses TRACE_PARENT_HEADER_LEN (68 bytes) as the cutoff for both checks.
++// EOH in the last 68 bytes is covered by the chunk overlap: the next chunk rescans
++// bytes [956..1023] at local indices [0..67].
++static int tp_eoh_match(u32 index, void *data) {
++    if (index >= (TRACE_BUF_SIZE - TRACE_PARENT_HEADER_LEN)) {
++        return 1;
++    }
++
++    struct callback_ctx_eoh *ctx = data;
++    unsigned char *s = &ctx->buf[index];
++
++    if (is_eoh(s)) {
++        ctx->eoh_pos = index;
++        return 1;
++    }
++
++    if (is_traceparent(s)) {
++        ctx->tp_pos = index;
++        return 1;
++    }
++
++    return 0;
++}
++
++// Like bpf_strstr_tp_loop but also stops at the end-of-headers marker.
++// Callers must not tail-call to the next chunk when *eoh_found is true.
++static __always_inline unsigned char *
++bpf_strstr_tp_eoh(unsigned char *buf, const u16 buf_len, bool *eoh_found) {
++    *eoh_found = false;
++    if (!g_bpf_traceparent_enabled) {
++        return NULL;
++    }
++
++    struct callback_ctx_eoh data = {
++        .buf = buf, .tp_pos = k_tp_pos_not_found, .eoh_pos = k_tp_pos_not_found};
++
++    bpf_loop((u32)buf_len, tp_eoh_match, &data, 0);
++
++    if (data.eoh_pos != k_tp_pos_not_found) {
++        *eoh_found = true;
++    }
++
++    if (data.tp_pos != k_tp_pos_not_found) {
++        return (data.tp_pos > (TRACE_BUF_SIZE - TRACE_PARENT_HEADER_LEN)) ? NULL
++                                                                          : &buf[data.tp_pos];
++    }
++
++    return NULL;
++}
++
+ static __always_inline unsigned char *bpf_strstr_tp_loop(unsigned char *buf, const u16 buf_len) {
+     if (!g_bpf_traceparent_enabled) {
+         return NULL;
+diff --git a/bpf/generictracer/java_tls.c b/bpf/generictracer/java_tls.c
+index b6b76df..ddb244c 100644
+--- a/bpf/generictracer/java_tls.c
++++ b/bpf/generictracer/java_tls.c
+@@ -232,7 +232,7 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
+ 
+         const u64 zero = 0;
+         bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_ANY);
+-        handle_buf_with_connection(ctx, &p_conn, buf, max_len, WITH_SSL, op, orig_dport);
++        handle_user_buf_with_connection(ctx, &p_conn, buf, max_len, WITH_SSL, op, orig_dport);
+     }
+ 
+     return 0;
+diff --git a/bpf/generictracer/k_tracer.c b/bpf/generictracer/k_tracer.c
+index 6c11690..b579f49 100644
+--- a/bpf/generictracer/k_tracer.c
++++ b/bpf/generictracer/k_tracer.c
+@@ -980,6 +980,8 @@ static __always_inline int return_recvmsg(void *ctx, struct sock *in_sock, u64 i
+     }
+ 
+     unsigned char *buf = 0;
++    u64 orig_ubuf = 0;
++    int full_copied_len = copied_len;
+     if (args) {
+         iovec_iter_ctx *iov_ctx = (iovec_iter_ctx *)&args->iovec_ctx;
+ 
+@@ -989,6 +991,18 @@ static __always_inline int return_recvmsg(void *ctx, struct sock *in_sock, u64 i
+             goto done;
+         }
+ 
++        if (bpf_core_enum_value_exists(enum iter_type___dummy, ITER_UBUF) &&
++            iov_ctx->iter_type == bpf_core_enum_value(enum iter_type___dummy, ITER_UBUF)) {
++            orig_ubuf = (u64)iov_ctx->ubuf;
++        } else if (iov_ctx->iter_type == bpf_core_enum_value(enum iter_type, ITER_IOVEC) &&
++                   iov_ctx->nr_segs == 1) {
++            // Pre-6.0: single-segment ITER_IOVEC is equivalent to ITER_UBUF.
++            struct iovec vec;
++            if (bpf_probe_read_kernel(&vec, sizeof(vec), &iov_ctx->iov[0]) == 0 && vec.iov_base) {
++                orig_ubuf = (u64)vec.iov_base;
++            }
++        }
++
+         buf = iovec_memory();
+         if (buf) {
+             copied_len = read_iovec_ctx(iov_ctx, buf, copied_len);
+@@ -1042,8 +1056,16 @@ static __always_inline int return_recvmsg(void *ctx, struct sock *in_sock, u64 i
+             if (buf && copied_len) {
+                 bpf_map_delete_elem(&active_recv_args, &id);
+                 // doesn't return must be logically last statement
+-                handle_buf_with_connection(
+-                    ctx, &info, buf, copied_len, NO_SSL, TCP_RECV, orig_dport);
++                handle_buf_with_connection_ext(ctx,
++                                               &info,
++                                               buf,
++                                               copied_len,
++                                               NO_SSL,
++                                               TCP_RECV,
++                                               orig_dport,
++                                               orig_ubuf,
++                                               full_copied_len,
++                                               0);
+             }
+         } else {
+             bpf_dbg_printk("identified SSL connection, ignoring: [%llx]...", *ssl);
+diff --git a/bpf/generictracer/k_tracer_defs.h b/bpf/generictracer/k_tracer_defs.h
+index b7ee306..159bdaf 100644
+--- a/bpf/generictracer/k_tracer_defs.h
++++ b/bpf/generictracer/k_tracer_defs.h
+@@ -60,6 +60,10 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
+     args->u_buf = (u64)u_buf;
+     args->lw_thread = lw_thread;
+     args->protocols = protocols;
++    args->orig_buf = 0;
++    args->full_bytes_len = 0;
++    args->niter = 0;
++    args->u_buf_is_user = 0;
+     args->protocol_type = protocol_type_for_conn_info(info);
+ 
+     args->pid_conn = *info;
+@@ -71,13 +75,16 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
+     return args;
+ }
+ 
+-static __always_inline void handle_buf_with_connection(void *ctx,
+-                                                       pid_connection_info_t *pid_conn,
+-                                                       void *u_buf,
+-                                                       int bytes_len,
+-                                                       u8 ssl,
+-                                                       u8 direction,
+-                                                       u16 orig_dport) {
++static __always_inline void handle_buf_with_connection_ext(void *ctx,
++                                                           pid_connection_info_t *pid_conn,
++                                                           void *u_buf,
++                                                           int bytes_len,
++                                                           u8 ssl,
++                                                           u8 direction,
++                                                           u16 orig_dport,
++                                                           u64 orig_buf,
++                                                           u32 full_bytes_len,
++                                                           u8 u_buf_is_user) {
+     call_protocol_args_t *args = make_protocol_args(pid_conn,
+                                                     k_lw_thread_none,
+                                                     k_protocol_selector_all,
+@@ -90,9 +97,34 @@ static __always_inline void handle_buf_with_connection(void *ctx,
+         return;
+     }
+ 
++    args->orig_buf = orig_buf;
++    args->full_bytes_len = full_bytes_len;
++    args->u_buf_is_user = u_buf_is_user;
+     bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+ }
+ 
++static __always_inline void handle_buf_with_connection(void *ctx,
++                                                       pid_connection_info_t *pid_conn,
++                                                       void *u_buf,
++                                                       int bytes_len,
++                                                       u8 ssl,
++                                                       u8 direction,
++                                                       u16 orig_dport) {
++    handle_buf_with_connection_ext(
++        ctx, pid_conn, u_buf, bytes_len, ssl, direction, orig_dport, 0, 0, 0);
++}
++
++static __always_inline void handle_user_buf_with_connection(void *ctx,
++                                                            pid_connection_info_t *pid_conn,
++                                                            void *u_buf,
++                                                            int bytes_len,
++                                                            u8 ssl,
++                                                            u8 direction,
++                                                            u16 orig_dport) {
++    handle_buf_with_connection_ext(
++        ctx, pid_conn, u_buf, bytes_len, ssl, direction, orig_dport, 0, 0, 1);
++}
++
+ static __always_inline void handle_light_weight_thread_buf(void *ctx,
+                                                            const lw_thread_t lw_thread,
+                                                            protocol_selector_t protocols,
+@@ -108,6 +140,7 @@ static __always_inline void handle_light_weight_thread_buf(void *ctx,
+         return;
+     }
+ 
++    args->u_buf_is_user = 1;
+     bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+ }
+ 
+diff --git a/bpf/generictracer/k_tracer_tailcall.h b/bpf/generictracer/k_tracer_tailcall.h
+index 06ad853..95fcc16 100644
+--- a/bpf/generictracer/k_tracer_tailcall.h
++++ b/bpf/generictracer/k_tracer_tailcall.h
+@@ -31,4 +31,7 @@ enum {
+     k_tail_protocol_http2_grpc_handle_end_frame = 10,
+     k_tail_protocol_http2_grpc_handle_start_frame_server = 11,
+     k_tail_protocol_http2_grpc_handle_start_frame_server_finalize = 12,
++    // Chunked traceparent scanner (PR#1988 backport; 13/14 on the v3.24.0 table)
++    k_tail_parse_traceparent_http = 13,
++    k_tail_parse_traceparent_http_append = 14,
+ };
+diff --git a/bpf/generictracer/protocol_handler.c b/bpf/generictracer/protocol_handler.c
+index 03ce2a7..9744a65 100644
+--- a/bpf/generictracer/protocol_handler.c
++++ b/bpf/generictracer/protocol_handler.c
+@@ -154,7 +154,16 @@ int obi_handle_buf_with_args(void *ctx) {
+                                        k_large_buf_action_append);
+ 
+                 if (reading) {
++                    const u32 prev_len = info->len;
+                     info->len += args->bytes_len;
++                    if (g_bpf_traceparent_enabled && capture_header_buffer &&
++                        bpf_max_request_tp_parse_size_kb > 0 &&
++                        prev_len < (u32)bpf_max_request_tp_parse_size_kb * 1024) {
++                        args->packet_type = packet_type;
++                        args->niter = 0;
++                        bpf_tail_call(ctx, &jump_table, k_tail_parse_traceparent_http_append);
++                        // tail-call failed — fall through.
++                    }
+                 } else if (responding) {
+                     info->end_monotime_ns = bpf_ktime_get_ns();
+                     bpf_d_printk("bytes len %d, new bytes %d", info->resp_len, args->bytes_len);
+diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
+index 1a94624..89f63dd 100644
+--- a/bpf/generictracer/protocol_http.h
++++ b/bpf/generictracer/protocol_http.h
+@@ -40,6 +40,16 @@ volatile const u32 high_request_volume;
+ 
+ SCRATCH_MEM_SIZED(http_previous_trace_id, TRACE_ID_SIZE_BYTES);
+ 
++// Tail-call budgets (BPF_MAX_TAIL_CALL_CNT = 32 on kernels 5.8–5.9):
++//   prog 14 (non-append): 3 preceding TCs + 28 self-TCs (niter=1..28) = 31
++//   prog 15 (append): tightest path is 3 preceding TCs + 29 self-TCs (niter=0..28) = 32
++// k_tp_chunk_step overlaps by TRACE_PARENT_HEADER_LEN so a header straddling
++// a chunk boundary is always fully contained in at least one window.
++enum {
++    k_tp_parse_max_niter = 29,
++    k_tp_chunk_step = TRACE_BUF_SIZE - TRACE_PARENT_HEADER_LEN,
++};
++
+ // empty_http_info zeroes and return the unique percpu copy in the map
+ // this function assumes that a given thread is not trying to use many
+ // instances at the same time
+@@ -453,6 +463,225 @@ int obi_continue2_protocol_http(struct pt_regs *ctx) {
+     return __obi_continue2_protocol_http(ctx, args, info, meta);
+ }
+ 
++volatile const u32 bpf_max_request_tp_parse_size_kb;
++
++enum tp_scan_result {
++    k_tp_scan_found,    /* traceparent extracted; tp_p->tp and info->tp updated */
++    k_tp_scan_eoh,      /* end-of-headers reached, no traceparent in headers */
++    k_tp_scan_done,     /* scan limit reached or read error, no traceparent */
++    k_tp_scan_continue, /* args->niter incremented; caller must tail-call scanner */
++};
++
++// On k_tp_scan_found, set_trace_info_for_connection has already been called.
++// On k_tp_scan_continue, args->niter has been incremented; caller must tail-call.
++static __always_inline enum tp_scan_result __tp_chunk_scan(call_protocol_args_t *args,
++                                                           http_info_t *info,
++                                                           tp_info_pid_t *tp_p,
++                                                           http_connection_metadata_t *meta,
++                                                           u32 type,
++                                                           u32 base_offset) {
++    const u32 chunk_size = k_tp_chunk_step;
++    const u32 max_bytes = (u32)bpf_max_request_tp_parse_size_kb * 1024;
++    const u32 offset = args->niter * chunk_size;
++
++    if (args->niter >= k_tp_parse_max_niter || (base_offset + offset) >= max_bytes) {
++        return k_tp_scan_done;
++    }
++
++    const bool use_orig = args->orig_buf && args->full_bytes_len > (u32)args->bytes_len;
++    bool read_user = args->u_buf_is_user;
++    u32 effective_len = (u32)args->bytes_len;
++    u64 read_base = args->u_buf;
++    if (use_orig) {
++        effective_len = args->full_bytes_len;
++        read_base = args->orig_buf;
++        read_user = true;
++    }
++
++    if (offset >= effective_len) {
++        return k_tp_scan_done;
++    }
++
++    unsigned char *buf = (unsigned char *)tp_char_buf_mem();
++    if (!buf) {
++        return k_tp_scan_done;
++    }
++
++    u32 to_read = effective_len - offset;
++    if (to_read > TRACE_BUF_SIZE) {
++        to_read = TRACE_BUF_SIZE;
++    }
++    const u32 remaining_budget =
++        max_bytes > (base_offset + offset) ? max_bytes - (base_offset + offset) : 0;
++    if (to_read > remaining_budget) {
++        to_read = remaining_budget;
++    }
++    if (to_read == 0) {
++        return k_tp_scan_done;
++    }
++
++    u32 buf_len = to_read;
++    bpf_clamp_umax(buf_len, TRACE_BUF_SIZE);
++
++    _Static_assert(TRACE_BUF_SIZE == 1024,
++                   "Please fix the __bpf_memzero statements below this line");
++    // Single 1024-byte __bpf_memzero increases verifier complexity on older kernels.
++    __bpf_memzero(buf, TRACE_BUF_SIZE / 2);
++    __bpf_memzero(buf + (TRACE_BUF_SIZE / 2), TRACE_BUF_SIZE / 2);
++
++    long read_ret;
++    if (read_user) {
++        read_ret = bpf_probe_read_user(buf, buf_len, (void *)(read_base + offset));
++    } else {
++        read_ret = bpf_probe_read_kernel(buf, buf_len, (void *)(read_base + offset));
++    }
++    if (read_ret < 0) {
++        return k_tp_scan_done;
++    }
++
++    bpf_dbg_printk("tp chunk scanning offset=%u to_read=%u niter=%u bytes_len=%u",
++                   offset,
++                   buf_len,
++                   args->niter,
++                   effective_len);
++
++    bool eoh_in_chunk = false;
++    unsigned char *res = bpf_strstr_tp_eoh(buf, buf_len, &eoh_in_chunk);
++    if (res) {
++        bpf_dbg_printk("Found chunked traceparent [%s] chunk %u", res, args->niter);
++        unsigned char *t_id = extract_trace_id(res);
++        unsigned char *f_id = extract_flags(res);
++        unsigned char *s_id = extract_span_id(res);
++
++        decode_hex(tp_p->tp.trace_id, t_id, TRACE_ID_CHAR_LEN);
++        decode_hex((unsigned char *)&tp_p->tp.flags, f_id, FLAGS_CHAR_LEN);
++        if (meta->type != EVENT_HTTP_CLIENT) {
++            decode_hex(tp_p->tp.parent_id, s_id, SPAN_ID_CHAR_LEN);
++        }
++
++        if (g_bpf_debug) {
++            unsigned char tp_buf[TP_MAX_VAL_LENGTH];
++            make_tp_string(tp_buf, &tp_p->tp);
++            bpf_dbg_printk("new tp via chunk: %s", tp_buf);
++        }
++
++        __builtin_memcpy(&info->tp, &tp_p->tp, sizeof(tp_info_t));
++        set_trace_info_for_connection(&args->pid_conn.conn, type, tp_p);
++        return k_tp_scan_found;
++    }
++
++    if (eoh_in_chunk) {
++        return k_tp_scan_eoh;
++    }
++
++    const u32 next_offset = (args->niter + 1) * chunk_size;
++    if (next_offset < effective_len && (base_offset + next_offset) < max_bytes &&
++        args->niter + 1 < k_tp_parse_max_niter) {
++        args->niter++;
++        return k_tp_scan_continue;
++    }
++    return k_tp_scan_done;
++}
++
++// k_tail_parse_traceparent_http (index 13)
++SEC("kprobe/http")
++int obi_parse_traceparent_http(struct pt_regs *ctx) {
++    call_protocol_args_t *args = protocol_args();
++    if (!args) {
++        return 0;
++    }
++
++    http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
++    if (!info) {
++        return 0;
++    }
++
++    http_connection_metadata_t *meta =
++        connection_meta_by_direction(args->direction, PACKET_TYPE_REQUEST);
++    if (!meta) {
++        bpf_tail_call(ctx, &jump_table, k_tail_continue2_protocol_http);
++        return 0;
++    }
++
++    const u32 type = trace_type_from_meta(meta);
++    tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_info_mem();
++    if (tp_p) {
++        enum tp_scan_result result = __tp_chunk_scan(args, info, tp_p, meta, type, 0);
++        if (result == k_tp_scan_continue) {
++            bpf_tail_call(ctx, &jump_table, k_tail_parse_traceparent_http);
++        }
++        if (result != k_tp_scan_found) {
++            set_trace_info_for_connection(&args->pid_conn.conn, type, tp_p);
++        }
++        server_or_client_trace(meta->type,
++                               &args->pid_conn.conn,
++                               args->lw_thread,
++                               tp_p,
++                               args->ssl,
++                               args->orig_dport,
++                               0,
++                               BPF_ANY);
++    } else {
++        bpf_dbg_printk(
++            "obi_parse_traceparent_http: tp_info_mem() returned NULL, skipping chunked scan");
++    }
++    // Inline the continuation so it runs even when the tail-call budget is exhausted.
++    return __obi_continue2_protocol_http(ctx, args, info, meta);
++}
++
++// k_tail_parse_traceparent_http_append (index 14)
++SEC("kprobe/http")
++int obi_parse_traceparent_http_append(struct pt_regs *ctx) {
++    call_protocol_args_t *args = protocol_args();
++    if (!args) {
++        return 0;
++    }
++
++    http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
++    if (!info) {
++        return 0;
++    }
++
++    http_connection_metadata_t *meta =
++        connection_meta_by_direction(args->direction, PACKET_TYPE_REQUEST);
++    if (!meta) {
++        http_send_large_buffer(ctx,
++                               info,
++                               &args->pid_conn,
++                               (void *)args->u_buf,
++                               args->bytes_len,
++                               args->packet_type,
++                               args->direction,
++                               k_large_buf_action_append);
++        return 0;
++    }
++
++    const u32 type = trace_type_from_meta(meta);
++    tp_info_pid_t *tp_p = trace_info_for_connection(&args->pid_conn.conn, type);
++    if (tp_p) {
++        const u32 base_offset = info->len - (u32)args->bytes_len;
++        enum tp_scan_result result = __tp_chunk_scan(args, info, tp_p, meta, type, base_offset);
++        if (result == k_tp_scan_continue) {
++            bpf_tail_call(ctx, &jump_table, k_tail_parse_traceparent_http_append);
++            // tail-call failed: fall through and emit with the current trace ID.
++        }
++        // k_tp_scan_found: set_trace_info_for_connection already called in helper.
++        // k_tp_scan_eoh / k_tp_scan_done: trace ID was committed during initial processing.
++    } else {
++        bpf_dbg_printk(
++            "obi_parse_traceparent_http_append: trace_info_for_connection() returned NULL");
++    }
++    http_send_large_buffer(ctx,
++                           info,
++                           &args->pid_conn,
++                           (void *)args->u_buf,
++                           args->bytes_len,
++                           args->packet_type,
++                           args->direction,
++                           k_large_buf_action_append);
++    return 0;
++}
++
+ static __always_inline int
+ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
+                                 call_protocol_args_t *args,
+@@ -530,6 +759,15 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
+                 }
+             } else {
+                 bpf_dbg_printk("No additional traceparent in headers, using what was made before");
++                const u32 total_len =
++                    (args->orig_buf && args->full_bytes_len > (u32)args->bytes_len)
++                        ? args->full_bytes_len
++                        : (u32)args->bytes_len;
++                if (tp_loop_fn == bpf_strstr_tp_loop && bpf_max_request_tp_parse_size_kb > 0 &&
++                    total_len > (TRACE_BUF_SIZE - 1)) {
++                    args->niter = 1;
++                    bpf_tail_call(ctx, &jump_table, k_tail_parse_traceparent_http);
++                }
+             }
+         } else {
+             goto done;
+@@ -793,7 +1031,17 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
+                                args->direction,
+                                k_large_buf_action_append);
+ 
++        const u32 prev_len = info->len;
++        // Must precede the tail-call: append mode derives base_offset from info->len.
+         info->len += args->bytes_len;
++        if (g_bpf_traceparent_enabled && capture_header_buffer &&
++            tp_loop_fn == bpf_strstr_tp_loop && bpf_max_request_tp_parse_size_kb > 0 &&
++            prev_len < (u32)bpf_max_request_tp_parse_size_kb * 1024) {
++            args->packet_type = PACKET_TYPE_REQUEST;
++            args->niter = 0;
++            bpf_tail_call(ctx, &jump_table, k_tail_parse_traceparent_http_append);
++            // tail-call failed — fall through.
++        }
+     } else if (still_responding(info)) {
+         info->end_monotime_ns = bpf_ktime_get_ns();
+         info->resp_len += args->bytes_len;
+diff --git a/bpf/generictracer/ssl_defs.h b/bpf/generictracer/ssl_defs.h
+index 3d988e6..be654b1 100644
+--- a/bpf/generictracer/ssl_defs.h
++++ b/bpf/generictracer/ssl_defs.h
+@@ -144,13 +144,13 @@ handle_ssl_buf(void *ctx, u64 id, ssl_args_t *args, int bytes_len, u8 direction)
+             // connection.
+             cleanup_trace_info_for_delayed_trace(&conn->p_conn, ssl, (void *)args->buf, bytes_len);
+             // must be last, doesn't return
+-            handle_buf_with_connection(ctx,
+-                                       &conn->p_conn,
+-                                       (void *)args->buf,
+-                                       bytes_len,
+-                                       WITH_SSL,
+-                                       direction,
+-                                       conn->orig_dport);
++            handle_user_buf_with_connection(ctx,
++                                            &conn->p_conn,
++                                            (void *)args->buf,
++                                            bytes_len,
++                                            WITH_SSL,
++                                            direction,
++                                            conn->orig_dport);
+         } else {
+             bpf_dbg_printk("No connection info! This is a bug.");
+         }
+diff --git a/devdocs/config/CONFIG.md b/devdocs/config/CONFIG.md
+index 9b7e67e..55978c9 100644
+--- a/devdocs/config/CONFIG.md
++++ b/devdocs/config/CONFIG.md
+@@ -168,6 +168,7 @@ EBPFTracer configuration for eBPF programs
+ | `ebpf.http_request_timeout` | `duration` | `OTEL_EBPF_BPF_HTTP_REQUEST_TIMEOUT` | `0s` | `30s`, `5m`, `1ms`, etc |  | Must be at least 0 |
+ | `ebpf.instrument_cuda` | `integer` | `OTEL_EBPF_INSTRUMENT_CUDA` | `auto` |  |  | Enables GPU instrumentation for CUDA kernel launches and allocations |
+ | `ebpf.kafka_topic_uuid_cache_size` | `integer` | `OTEL_KAFKA_TOPIC_UUID_CACHE_SIZE` | `1024` |  |  | Kafka Topic UUID to Name cache size. |
++| `ebpf.max_request_tp_parse_size_kb` | `integer` | `OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB` | `4` |  |  | Maximum size in kilobytes to scan for a traceparent header buried after large HTTP headers. Valid range: 4–27. How much of this budget is actually used depends on the Linux kernel version running on the node:    - kernel < 5.17: this setting is ignored entirely. Only the first ~350     bytes of a request are scanned. Traceparent headers placed after large     headers (e.g. big auth tokens or cookies) will not be found.    - kernel 5.17 or newer: the full budget applies. The scanner reads through     the request in 956-byte steps until it finds the header or exhausts the     budget. Works for the vast majority of HTTP clients (curl, standard Go     and Java HTTP clients, nginx, envoy, …).      On kernels older than 6.0, a rare limitation may apply: if an     application explicitly sends a request using multiple separate memory     buffers at once (scatter-gather I/O with nr_segs > 1), the chunked     rescan is unavailable because orig_buf is only captured for single-segment     requests. The initial read still covers up to 16 segments (8 KB total),     but no chunked scan beyond that initial copy is possible.     If the traceparent header falls beyond that 8 KB boundary it will not be     found, regardless of this setting. This does not affect the common case     where the full request is in a single contiguous buffer (curl, Go, Java,     most proxies). On kernel 6.0 and newer this limitation does not exist.  On kernels without bpf_loop support (< 5.17), chunked scanning is disabled automatically regardless of this setting. To stop traceparent scanning entirely, disable both context propagation and track_request_headers.  The scanner stops as soon as it detects the end-of-headers boundary (CRLFCRLF) within a chunk, so it does not read into the request body within a single received buffer. For multi-segment TCP requests where headers and body arrive in separate kernel receive calls, OBI cannot distinguish a body-only segment from a header segment; in that case the body is not scanned because the traceparent has already been found or the headers-complete event was observed in an earlier segment.  Minimum is 4 KB because the chunked scanner starts at the second chunk (niter=1, offset=956 bytes): the first ~1 KB is already scanned in the initial BPF pass. A budget below ~1 KB would never trigger a second chunk and the setting would have no effect. 4 KB provides at least three additional 956-byte windows and covers the common case of a single large header (e.g. a 2-3 KB auth token or cookie) before traceparent. Maximum is 27 KB to stay within the tail-call budget (tightest path: 3 preceding TCs + 29 invocations of prog 14 = 32 = BPF_MAX_TAIL_CALL_CNT; at niter=28, offset=28×956=26,768; budget cap of 27×1024=27,648 limits the last read to 880 bytes; next chunk at 29×956=27,724 exceeds the budget and is never read). |
+ | `ebpf.max_transaction_time` | `duration` | `OTEL_EBPF_BPF_MAX_TRANSACTION_TIME` | `5m` | `30s`, `5m`, `1ms`, etc |  | Maximum time allowed for two requests to be correlated as parent -> child Some programs (e.g. load generators) keep on generating requests from the same thread in perpetuity, which can generate very large traces. We want to mark the parent trace as invalid if this happens. |
+ | `ebpf.mongo_requests_cache_size` | `integer` | `OTEL_EBPF_BPF_MONGO_REQUESTS_CACHE_SIZE` | `1024` |  |  | MongoDB requests cache size. |
+ | `ebpf.mssql_prepared_statements_cache_size` | `integer` | `OTEL_EBPF_BPF_MSSQL_PREPARED_STATEMENTS_CACHE_SIZE` | `1024` |  |  | MSSQL prepared statements cache size. |
+diff --git a/devdocs/config/config-schema.json b/devdocs/config/config-schema.json
+index 12633f7..477a0ba 100644
+--- a/devdocs/config/config-schema.json
++++ b/devdocs/config/config-schema.json
+@@ -713,6 +713,14 @@
+           "$ref": "#/$defs/MapsConfig",
+           "description": "eBPF map configurations"
+         },
++        "max_request_tp_parse_size_kb": {
++          "type": "integer",
++          "maximum": 27,
++          "minimum": 4,
++          "description": "Maximum size in kilobytes to scan for a traceparent header buried after large HTTP headers. Valid range: 4–27. How much of this budget is actually used depends on the Linux kernel version running on the node:    - kernel < 5.17: this setting is ignored entirely. Only the first ~350     bytes of a request are scanned. Traceparent headers placed after large     headers (e.g. big auth tokens or cookies) will not be found.    - kernel 5.17 or newer: the full budget applies. The scanner reads through     the request in 956-byte steps until it finds the header or exhausts the     budget. Works for the vast majority of HTTP clients (curl, standard Go     and Java HTTP clients, nginx, envoy, …).      On kernels older than 6.0, a rare limitation may apply: if an     application explicitly sends a request using multiple separate memory     buffers at once (scatter-gather I/O with nr_segs > 1), the chunked     rescan is unavailable because orig_buf is only captured for single-segment     requests. The initial read still covers up to 16 segments (8 KB total),     but no chunked scan beyond that initial copy is possible.     If the traceparent header falls beyond that 8 KB boundary it will not be     found, regardless of this setting. This does not affect the common case     where the full request is in a single contiguous buffer (curl, Go, Java,     most proxies). On kernel 6.0 and newer this limitation does not exist.  On kernels without bpf_loop support (< 5.17), chunked scanning is disabled automatically regardless of this setting. To stop traceparent scanning entirely, disable both context propagation and track_request_headers.  The scanner stops as soon as it detects the end-of-headers boundary (CRLFCRLF) within a chunk, so it does not read into the request body within a single received buffer. For multi-segment TCP requests where headers and body arrive in separate kernel receive calls, OBI cannot distinguish a body-only segment from a header segment; in that case the body is not scanned because the traceparent has already been found or the headers-complete event was observed in an earlier segment.  Minimum is 4 KB because the chunked scanner starts at the second chunk (niter=1, offset=956 bytes): the first ~1 KB is already scanned in the initial BPF pass. A budget below ~1 KB would never trigger a second chunk and the setting would have no effect. 4 KB provides at least three additional 956-byte windows and covers the common case of a single large header (e.g. a 2-3 KB auth token or cookie) before traceparent. Maximum is 27 KB to stay within the tail-call budget (tightest path: 3 preceding TCs + 29 invocations of prog 14 = 32 = BPF_MAX_TAIL_CALL_CNT; at niter=28, offset=28×956=26,768; budget cap of 27×1024=27,648 limits the last read to 880 bytes; next chunk at 29×956=27,724 exceeds the budget and is never read).",
++          "default": 4,
++          "x-env-var": "OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB"
++        },
+         "max_transaction_time": {
+           "type": "string",
+           "pattern": "^[0-9]+(ms|s|m)$",
+diff --git a/devdocs/features.md b/devdocs/features.md
+index 2ac70f1..c3a1489 100644
+--- a/devdocs/features.md
++++ b/devdocs/features.md
+@@ -74,6 +74,23 @@ Large payloads are streamed to userspace across multiple ring-buffer events and
+ 
+ Equivalent YAML keys live under `ebpf.buffer_sizes.{http,mysql,kafka,postgres,mssql}`.
+ 
++## Chunked Traceparent Scanner
++
++When the `traceparent` W3C header is placed after large HTTP headers (auth tokens, cookies, correlation IDs)
++that push it beyond the initial ~1 KB scan window, OBI uses a tail-call-driven chunked scanner to find it.
++The scanner walks the request in 956-byte overlapping windows and stops as soon as it finds the header or
++reaches the end-of-headers marker (`\r\n\r\n`).
++
++This feature requires context propagation or request header tracking to be enabled
++(`OTEL_EBPF_TRACK_REQUEST_HEADERS=true` or `OTEL_EBPF_CONTEXT_PROPAGATION=true`) and kernel ≥ 5.17 (`bpf_loop` support). On older kernels the scanner is automatically disabled
++and only the first ~1 KB of the request is searched.
++
++| Environment variable | Range | Default | Notes |
++|:---------------------|------:|--------:|:------|
++| `OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB` | 4–27 | 4 | Maximum kilobytes to scan. 4 KB covers a single large header before `traceparent`; 27 KB is the tail-call budget ceiling (29 iterations × 956 bytes). Requires kernel ≥ 5.17. |
++
++Equivalent YAML key: `ebpf.max_request_tp_parse_size_kb`.
++
+ ## GPU Instrumentation
+ 
+ Specifically for instrumenting GPU execution primitives, like NVIDIA CUDA kernel launches and memory copies. This
+diff --git a/internal/test/integration/components/tpclient/service.js b/internal/test/integration/components/tpclient/service.js
+index 6ad43b1..b4667b3 100644
+--- a/internal/test/integration/components/tpclient/service.js
++++ b/internal/test/integration/components/tpclient/service.js
+@@ -22,6 +22,22 @@ const STATIC_TRACEPARENT = '00-12345678901234567890123456789012-0000000000000001
+ // This traceparent is forwarded unchanged through the chain to trigger eBPF proxy detection
+ const FORWARDED_TRACEPARENT = '00-12345678901234567890123456789012-1111111111111111-01';
+ 
++function nextTraceparent(traceparent, fallback) {
++  const current = traceparent || fallback;
++  const parts = current.split('-');
++  if (parts.length !== 4) {
++    return current;
++  }
++
++  const spanId = parseInt(parts[2], 16);
++  if (Number.isNaN(spanId)) {
++    return current;
++  }
++
++  const newSpanId = (spanId + 0x10).toString(16).padStart(16, '0');
++  return `${parts[0]}-${parts[1]}-${newSpanId}-${parts[3]}`;
++}
++
+ // Endpoint: Request WITHOUT traceparent (eBPF should generate)
+ app.get('/no-tp', async (req, res) => {
+   if (upstream) {
+@@ -47,15 +63,7 @@ app.get('/with-tp', async (req, res) => {
+       const downstreamURL = `${upstream}/with-tp`;
+ 
+       // Get traceparent from incoming request or use base
+-      let traceparent = req.headers.traceparent || STATIC_TRACEPARENT;
+-
+-      // Parse and increment span ID by 0x10 for downstream call
+-      const parts = traceparent.split('-');
+-      if (parts.length === 4) {
+-        const spanId = parseInt(parts[2], 16);
+-        const newSpanId = (spanId + 0x10).toString(16).padStart(16, '0');
+-        traceparent = `${parts[0]}-${parts[1]}-${newSpanId}-${parts[3]}`;
+-      }
++      const traceparent = nextTraceparent(req.headers.traceparent, STATIC_TRACEPARENT);
+ 
+       console.log(`[${route}/with-tp] Making client call to ${downstreamURL} WITH traceparent: ${traceparent}`);
+ 
+@@ -96,11 +104,36 @@ app.get('/with-forwarded-tp', async (req, res) => {
+   }
+ });
+ 
++// Endpoint: Request WITH huge headers before traceparent (eBPF chunked parsing)
++app.get('/with-huge-tp', async (req, res) => {
++  if (upstream) {
++    try {
++      const downstreamURL = `${upstream}/with-huge-tp`;
++      const traceparent = nextTraceparent(req.headers.traceparent, STATIC_TRACEPARENT);
++      // Send a large filler header (~2500 bytes) to push traceparent beyond the 1KB window
++      const hugeValue = 'X'.repeat(2500);
++      console.log(`[${route}/with-huge-tp] Making client call to ${downstreamURL} WITH huge headers + traceparent`);
++      const response = await axios.get(downstreamURL, {
++        headers: {
++          'a-filler': hugeValue, // 'a' sorts before 'traceparent' regardless of header ordering
++          'traceparent': traceparent
++        }
++      });
++      res.send(`${route}/with-huge-tp → ${response.data}`);
++    } catch (err) {
++      console.error(`[${route}/with-huge-tp] Error:`, err.message);
++      res.status(500).send(`Error: ${err.message}`);
++    }
++  } else {
++    res.send(`End of chain (${route})`);
++  }
++});
++
+ app.get('/smoke', (req, res) => {
+   res.sendStatus(200);
+ });
+ 
+ app.listen(port, () => {
+-  console.log(`Service ${route.toUpperCase()} running on port ${port}`);
++  console.log(`Service ${route.toUpperCase()} HTTP running on port ${port}`);
+   console.log(upstream ? `Upstream: ${upstream}` : `End of chain`);
+ });
+diff --git a/internal/test/integration/traceparent_extraction_test.go b/internal/test/integration/traceparent_extraction_test.go
+index 9a6abe9..789d906 100644
+--- a/internal/test/integration/traceparent_extraction_test.go
++++ b/internal/test/integration/traceparent_extraction_test.go
+@@ -4,8 +4,12 @@
+ package integration
+ 
+ import (
++	"fmt"
++	"io"
++	"net"
+ 	"net/http"
+ 	"path"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -19,8 +23,27 @@ import (
+ )
+ 
+ const (
+-	staticTraceID   = "12345678901234567890123456789012" // Easy to spot
+-	forwardedSpanID = "1111111111111111"                 // Span ID used in forwarded traceparent
++	staticTraceID           = "12345678901234567890123456789012" // Easy to spot
++	staticHugeTPTraceID     = "aabbccddeeff00112233445566778899" // Distinct ID for the HTTP huge-headers sub-test
++	staticBoundaryTPTraceID = "deadbeefcafe00112233445566778899" // Distinct ID for the chunk-boundary sub-test
++	forwardedSpanID         = "1111111111111111"                 // Span ID used in forwarded traceparent
++
++	// traceparentChunkBoundary is the number of filler bytes that places the
++	// traceparent header exactly at byte offset 956 of the TCP stream.
++	//
++	// Derivation:
++	//   k_tp_chunk_step = TRACE_BUF_SIZE - TRACE_PARENT_HEADER_LEN = 1024 - 68 = 956
++	//   HTTP overhead before the traceparent header line:
++	//     "GET /with-huge-tp HTTP/1.1\r\n" = 28 bytes
++	//     "Host: localhost:6000\r\n"        = 22 bytes
++	//     "A-Filler: <filler>\r\n" prefix  = 10 + 2 = 12 bytes
++	//     ─────────────────────────────────────────────────
++	//     total fixed overhead              = 62 bytes
++	//   fillerSize = 956 - 62 = 894
++	//
++	// With fillerSize=894 the eBPF strstr guard (index >= 956) skips the
++	// traceparent in chunk 0; it is found at local index 0 of chunk 1.
++	traceparentChunkBoundary = 894
+ )
+ 
+ // TestTraceparentExtraction validates that the eBPF tpinjector correctly:
+@@ -57,6 +80,8 @@ func TestTraceparentExtraction(t *testing.T) {
+ 	t.Run("without_traceparent", testWithoutTraceparent)
+ 	t.Run("with_traceparent", testWithTraceparent)
+ 	t.Run("with_forwarded_traceparent", testWithForwardedTraceparent)
++	t.Run("with_huge_headers_traceparent", testWithHugeHeadersTraceparent)
++	t.Run("with_traceparent_at_chunk_boundary", testWithTraceparentAtChunkBoundary)
+ 
+ 	runWeaverValidation(t)
+ 
+@@ -215,3 +240,145 @@ func requireChildOfReference(t *testing.T, child, parent jaeger.Span, msgAndArgs
+ 	}
+ 	require.Fail(t, "missing CHILD_OF reference", msgAndArgs...)
+ }
++
++// sendRawRequest writes a raw HTTP/1.1 GET request over a plain TCP connection.
++// The header order is fully controlled by the caller, which is not guaranteed by
++// net/http (headers are sorted alphabetically before being written to the wire).
++// The response is drained and the connection is closed before returning.
++func sendRawRequest(addr, urlPath string, fillerSize int, traceparent string) error {
++	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
++	if err != nil {
++		return err
++	}
++	defer conn.Close()
++
++	var sb strings.Builder
++	fmt.Fprintf(&sb, "GET %s HTTP/1.1\r\n", urlPath)
++	fmt.Fprintf(&sb, "Host: %s\r\n", addr)
++	fmt.Fprintf(&sb, "A-Filler: %s\r\n", strings.Repeat("X", fillerSize))
++	fmt.Fprintf(&sb, "traceparent: %s\r\n", traceparent)
++	sb.WriteString("Connection: close\r\n")
++	sb.WriteString("\r\n")
++
++	if _, err = io.WriteString(conn, sb.String()); err != nil {
++		return err
++	}
++	// Drain the response so the server has time to process the request before
++	// the connection is closed. A deadline avoids blocking forever if the server
++	// does not honor Connection: close.
++	if err = conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
++		return err
++	}
++	_, err = io.ReadAll(conn)
++	return err
++}
++
++// testWithTraceparentAtChunkBoundary validates that the eBPF chunked tail-call
++// parser finds the traceparent header when it is placed exactly at the chunk
++// boundary (byte offset 956 of the TCP stream). This is the case where the eBPF
++// strstr guard (index >= TRACE_BUF_SIZE - TRACE_PARENT_HEADER_LEN = 956) skips
++// the header in chunk 0 and it is only found at local index 0 of chunk 1.
++func testWithTraceparentAtChunkBoundary(t *testing.T) {
++	tp := "00-" + staticBoundaryTPTraceID + "-0000000000000001-01"
++	err := sendRawRequest("localhost:6000", "/with-huge-tp", traceparentChunkBoundary, tp)
++	require.NoError(t, err)
++
++	assertHugeHeadersTraceparent(t, hugeHeadersCase{
++		jaegerService: "tpclient-a",
++		chainServices: []string{"tpclient-a", "tpclient-b", "tpclient-c"},
++		traceID:       staticBoundaryTPTraceID,
++		urlPath:       "/with-huge-tp",
++	})
++}
++
++// testWithHugeHeadersTraceparent validates that when a large filler header (>2KB)
++// precedes the Traceparent header, the eBPF chunked tail-call parser still finds it.
++func testWithHugeHeadersTraceparent(t *testing.T) {
++	req, err := http.NewRequest(http.MethodGet, "http://localhost:6000/with-huge-tp", nil)
++	require.NoError(t, err)
++	// Header name is chosen so it sorts before "Traceparent" alphabetically.
++	// net/http writes request headers in sorted order, so this guarantees the
++	// filler precedes the traceparent on the wire and forces the chunked parser path.
++	req.Header.Set("big-filler", strings.Repeat("X", 2500))
++	req.Header.Set("traceparent", "00-"+staticHugeTPTraceID+"-0000000000000001-01")
++
++	resp, err := http.DefaultClient.Do(req)
++	require.NoError(t, err)
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++	require.NoError(t, resp.Body.Close())
++
++	assertHugeHeadersTraceparent(t, hugeHeadersCase{
++		jaegerService: "tpclient-a",
++		chainServices: []string{"tpclient-a", "tpclient-b", "tpclient-c"},
++		traceID:       staticHugeTPTraceID,
++		urlPath:       "/with-huge-tp",
++	})
++}
++
++// hugeHeadersCase holds the parameters that vary across the huge-headers
++// traceparent sub-tests. jaegerService is the entry service of the chain.
++// chainServices lists every service expected to contribute a server span;
++// the assertion verifies each one is present so a partial trace (e.g. only
++// tpclient-a showed up) is detected and retried.
++type hugeHeadersCase struct {
++	jaegerService string
++	chainServices []string
++	traceID       string
++	urlPath       string
++}
++
++// assertHugeHeadersTraceparent polls Jaeger until the expected trace appears
++// and asserts that every span in the chain carries the static trace ID,
++// proving the eBPF parser found the traceparent even when it was buried
++// after 2KB+ of filler headers.
++func assertHugeHeadersTraceparent(t *testing.T, c hugeHeadersCase) {
++	t.Helper()
++	opName := "GET " + c.urlPath
++	require.EventuallyWithT(t, func(ct *assert.CollectT) {
++		resp, err := http.Get(jaegerQueryURL + "?service=" + c.jaegerService + "&traceID=" + c.traceID)
++		require.NoError(ct, err)
++		defer resp.Body.Close()
++		require.Equal(ct, http.StatusOK, resp.StatusCode)
++
++		var tq jaeger.TracesQuery
++		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
++
++		traces := tq.FindBySpan(jaeger.Tag{Key: "url.path", Type: "string", Value: c.urlPath})
++		require.GreaterOrEqual(ct, len(traces), 1,
++			"should find trace with huge headers + traceparent for service %s", c.jaegerService)
++
++		// Iterate all returned traces to find the first one where every chain
++		// service has contributed a server span. Using traces[0] unconditionally
++		// risks a false positive when Jaeger returns a stale complete trace from
++		// a previous run alongside the current one (same static trace ID).
++		var trace *jaeger.Trace
++		for i := range traces {
++			tr := &traces[i]
++			allPresent := true
++			for _, svc := range c.chainServices {
++				found := false
++				for _, span := range tr.FindByOperationName(opName, "server") {
++					if proc, ok := tr.Processes[span.ProcessID]; ok && proc.ServiceName == svc {
++						found = true
++						break
++					}
++				}
++				if !found {
++					allPresent = false
++					break
++				}
++			}
++			if allPresent {
++				trace = tr
++				break
++			}
++		}
++		require.NotNil(ct, trace,
++			"no complete trace found with all chain services for traceID %s", c.traceID)
++
++		for _, span := range trace.Spans {
++			require.Equal(ct, c.traceID, span.TraceID,
++				"eBPF parser should extract the static trace ID even when buried after 2KB+ of headers")
++		}
++	}, testTimeout, 100*time.Millisecond)
++}
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index bcf631d..7a7082f 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -150,6 +150,54 @@ type EBPFTracer struct {
+ 
+ 	// eBPF map configurations
+ 	MapsConfig MapsConfig `yaml:"maps_config"`
++
++	// Maximum size in kilobytes to scan for a traceparent header buried after large
++	// HTTP headers. Valid range: 4–27. How much of this budget is actually used
++	// depends on the Linux kernel version running on the node:
++	//
++	//   - kernel < 5.17: this setting is ignored entirely. Only the first ~350
++	//     bytes of a request are scanned. Traceparent headers placed after large
++	//     headers (e.g. big auth tokens or cookies) will not be found.
++	//
++	//   - kernel 5.17 or newer: the full budget applies. The scanner reads through
++	//     the request in 956-byte steps until it finds the header or exhausts the
++	//     budget. Works for the vast majority of HTTP clients (curl, standard Go
++	//     and Java HTTP clients, nginx, envoy, …).
++	//
++	//     On kernels older than 6.0, a rare limitation may apply: if an
++	//     application explicitly sends a request using multiple separate memory
++	//     buffers at once (scatter-gather I/O with nr_segs > 1), the chunked
++	//     rescan is unavailable because orig_buf is only captured for single-segment
++	//     requests. The initial read still covers up to 16 segments (8 KB total),
++	//     but no chunked scan beyond that initial copy is possible.
++	//     If the traceparent header falls beyond that 8 KB boundary it will not be
++	//     found, regardless of this setting. This does not affect the common case
++	//     where the full request is in a single contiguous buffer (curl, Go, Java,
++	//     most proxies). On kernel 6.0 and newer this limitation does not exist.
++	//
++	// On kernels without bpf_loop support (< 5.17), chunked scanning is disabled
++	// automatically regardless of this setting. To stop traceparent scanning
++	// entirely, disable both context propagation and track_request_headers.
++	//
++	// The scanner stops as soon as it detects the end-of-headers boundary
++	// (CRLFCRLF) within a chunk, so it does not read into the request body
++	// within a single received buffer. For multi-segment TCP requests where
++	// headers and body arrive in separate kernel receive calls, OBI cannot
++	// distinguish a body-only segment from a header segment; in that case the
++	// body is not scanned because the traceparent has already been found or the
++	// headers-complete event was observed in an earlier segment.
++	//
++	// Minimum is 4 KB because the chunked scanner starts at the second chunk
++	// (niter=1, offset=956 bytes): the first ~1 KB is already scanned in the
++	// initial BPF pass. A budget below ~1 KB would never trigger a second
++	// chunk and the setting would have no effect. 4 KB provides at least
++	// three additional 956-byte windows and covers the common case of a
++	// single large header (e.g. a 2-3 KB auth token or cookie) before
++	// traceparent. Maximum is 27 KB to stay within the tail-call budget
++	// (tightest path: 3 preceding TCs + 29 invocations of prog 14 = 32 = BPF_MAX_TAIL_CALL_CNT;
++	// at niter=28, offset=28×956=26,768; budget cap of 27×1024=27,648 limits the last read
++	// to 880 bytes; next chunk at 29×956=27,724 exceeds the budget and is never read).
++	MaxRequestTPParseSizeKB int `yaml:"max_request_tp_parse_size_kb" env:"OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB" validate:"gte=4,lte=27" jsonschema:"minimum=4,maximum=27,default=4"`
+ }
+ 
+ var nvidiaSMIExistsFunc = nvidiaSMIExists
+diff --git a/pkg/ebpf/common/common.go b/pkg/ebpf/common/common.go
+index 9877a2e..288619b 100644
+--- a/pkg/ebpf/common/common.go
++++ b/pkg/ebpf/common/common.go
+@@ -611,7 +611,6 @@ func FixupSpec(spec *ebpf.CollectionSpec, overrideKernelVersion bool) {
+ 		},
+ 		License: "MIT",
+ 	}
+-
+ 	if !SupportsEBPFLoops(ptlog(), overrideKernelVersion) {
+ 		// Swap the bpf_loop-based programs with their legacy counterparts so
+ 		// bpf2go-generated struct fields still bind on kernels without bpf_loop.
+@@ -619,7 +618,6 @@ func FixupSpec(spec *ebpf.CollectionSpec, overrideKernelVersion bool) {
+ 		spec.Programs["obi_protocol_http"].Name = "obi_protocol_http"
+ 		spec.Programs["obi_continue_protocol_http"] = spec.Programs["obi_continue_protocol_http_legacy"]
+ 		spec.Programs["obi_continue_protocol_http"].Name = "obi_continue_protocol_http"
+-
+ 		// gotracer's obi_uprobe_readMimeHeader inlines a bpf_loop call. The
+ 		// runtime probe map (see gotracer.Tracer.UProbes) only attaches it on
+ 		// kernels >= 5.17, but the program still loads as part of the spec.
+@@ -631,8 +629,10 @@ func FixupSpec(spec *ebpf.CollectionSpec, overrideKernelVersion bool) {
+ 		if _, ok := spec.Programs["obi_uprobe_readMimeHeader"]; ok {
+ 			spec.Programs["obi_uprobe_readMimeHeader"] = dummy
+ 		}
++		// bpf_loop requires kernel ≥ 5.17; replace with stubs on older kernels.
++		spec.Programs["obi_parse_traceparent_http"] = dummy.Copy()
++		spec.Programs["obi_parse_traceparent_http_append"] = dummy.Copy()
+ 	}
+-
+ 	// Slot dummies in place of the legacy programs we already moved, so the
+ 	// bpf2go struct binding still resolves them.
+ 	spec.Programs["obi_protocol_http_legacy"] = dummy
+diff --git a/pkg/ebpf/common/http_transform.go b/pkg/ebpf/common/http_transform.go
+index 6737bdf..4c9cd88 100644
+--- a/pkg/ebpf/common/http_transform.go
++++ b/pkg/ebpf/common/http_transform.go
+@@ -14,6 +14,8 @@ import (
+ 	"strconv"
+ 	"strings"
+ 
++	"go.opentelemetry.io/otel/trace"
++
+ 	"go.opentelemetry.io/obi/pkg/appolly/app"
+ 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
+ 	ebpfhttp "go.opentelemetry.io/obi/pkg/ebpf/common/http"
+@@ -276,14 +278,14 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
+ 		isClient                      = isClientEvent(event.Type)
+ 	)
+ 
+-	slog.Debug("Event", "traceID", event.Tp.TraceId, "conn", event.ConnInfo, "buf", event.Buf[:])
++	slog.Debug("Event", "traceID", trace.TraceID(event.Tp.TraceId), "conn", event.ConnInfo, "buf", event.Buf[:])
+ 
+ 	if event.HasLargeBuffers == 1 {
+ 		b, ok := extractTCPLargeBuffer(parseCtx, event.Tp.TraceId, packetTypeRequest, directionByPacketType(packetTypeRequest, isClient), event.ConnInfo, ProtocolTypeHTTP)
+ 		if ok {
+ 			requestBuffer = b
+ 		} else {
+-			slog.Debug("missing large buffer for HTTP request", "traceID", event.Tp.TraceId, "conn", event.ConnInfo, "packetType", packetTypeRequest)
++			slog.Debug("missing large buffer for HTTP request", "traceID", trace.TraceID(event.Tp.TraceId), "conn", event.ConnInfo, "packetType", packetTypeRequest)
+ 			requestBuffer = largebuf.NewLargeBufferFrom(event.Buf[:])
+ 		}
+ 
+@@ -292,7 +294,7 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
+ 			responseBuffer = b
+ 			hasResponse = true
+ 		} else {
+-			slog.Debug("missing large buffer for HTTP response", "traceID", event.Tp.TraceId, "conn", event.ConnInfo, "packetType", packetTypeResponse)
++			slog.Debug("missing large buffer for HTTP response", "traceID", trace.TraceID(event.Tp.TraceId), "conn", event.ConnInfo, "packetType", packetTypeResponse)
+ 		}
+ 	} else {
+ 		requestBuffer = largebuf.NewLargeBufferFrom(event.Buf[:])
+diff --git a/pkg/internal/ebpf/generictracer/generictracer.go b/pkg/internal/ebpf/generictracer/generictracer.go
+index a0f9d30..7db0c6c 100644
+--- a/pkg/internal/ebpf/generictracer/generictracer.go
++++ b/pkg/internal/ebpf/generictracer/generictracer.go
+@@ -52,6 +52,7 @@ type Tracer struct {
+ 	iters            []*ebpfcommon.Iter
+ 	eventCtx         *ebpfcommon.EBPFEventContext
+ 	jvmUSDTManager   ebpfcommon.USDTSpecManager
++	supportsBPFLoop  bool
+ }
+ 
+ func tlog() *slog.Logger {
+@@ -59,8 +60,9 @@ func tlog() *slog.Logger {
+ }
+ 
+ func New(pidFilter ebpfcommon.ServiceFilter, cfg *obi.Config, metrics imetrics.Reporter) *Tracer {
++	log := tlog()
+ 	return &Tracer{
+-		log:              tlog(),
++		log:              log,
+ 		cfg:              cfg,
+ 		metrics:          metrics,
+ 		pidsFilter:       pidFilter,
+@@ -70,6 +72,7 @@ func New(pidFilter ebpfcommon.ServiceFilter, cfg *obi.Config, metrics imetrics.R
+ 		instrumentedLibs: make(ebpfcommon.InstrumentedLibsT),
+ 		libsMux:          sync.Mutex{},
+ 		iters:            []*ebpfcommon.Iter{},
++		supportsBPFLoop:  ebpfcommon.SupportsEBPFLoops(log, cfg.EBPF.OverrideBPFLoopEnabled),
+ 	}
+ }
+ 
+@@ -137,7 +140,7 @@ func (p *Tracer) BlockPID(pid app.PID, ns uint32) {
+ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
+ 	if p.cfg.EBPF.TrackRequestHeaders ||
+ 		p.cfg.EBPF.ContextPropagation.IsEnabled() {
+-		p.log.Info("Enabling trace information parsing", "bpf_loop_enabled", ebpfcommon.SupportsEBPFLoops(p.log, p.cfg.EBPF.OverrideBPFLoopEnabled))
++		p.log.Info("Enabling trace information parsing", "bpf_loop_enabled", p.supportsBPFLoop)
+ 	}
+ 
+ 	spec, err := LoadBpf()
+@@ -170,6 +173,9 @@ func (p *Tracer) SetupTailCalls() {
+ 		p.bpfObjects.ObiProtocolHttp2GrpcHandleEndFrame,                 // 10
+ 		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServer,         // 11
+ 		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServerFinalize, // 12
++		// Chunked traceparent scanner
++		p.bpfObjects.ObiParseTraceparentHttp,       // 13  k_tail_parse_traceparent_http
++		p.bpfObjects.ObiParseTraceparentHttpAppend, // 14  k_tail_parse_traceparent_http_append
+ 	} {
+ 		if prog == nil {
+ 			continue
+@@ -231,6 +237,14 @@ func (p *Tracer) constants() map[string]any {
+ 		m["jvm_sampling_interval_ns"] = uint64(p.cfg.JVMRuntimeMetrics.SamplingInterval.Nanoseconds())
+ 	}
+ 
++	if p.supportsBPFLoop {
++		m["bpf_max_request_tp_parse_size_kb"] = uint32(p.cfg.EBPF.MaxRequestTPParseSizeKB)
++	} else {
++		// bpf_loop is unavailable on this kernel; set to 0 to prevent tail-calls
++		// into the dummy stubs replacing obi_parse_traceparent_http{,_append}.
++		m["bpf_max_request_tp_parse_size_kb"] = uint32(0)
++	}
++
+ 	return m
+ }
+ 
+diff --git a/pkg/internal/ebpf/generictracer/generictracer_test.go b/pkg/internal/ebpf/generictracer/generictracer_test.go
+index 0d191ab..a6e272d 100644
+--- a/pkg/internal/ebpf/generictracer/generictracer_test.go
++++ b/pkg/internal/ebpf/generictracer/generictracer_test.go
+@@ -7,6 +7,7 @@ package generictracer
+ 
+ import (
+ 	"context"
++	"log/slog"
+ 	"testing"
+ 	"time"
+ 	"unsafe"
+@@ -20,6 +21,7 @@ import (
+ 	jvmruntime "go.opentelemetry.io/obi/pkg/appolly/app/runtime"
+ 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+ 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
++	"go.opentelemetry.io/obi/pkg/config"
+ 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
+ 	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
+ 	"go.opentelemetry.io/obi/pkg/ebpf/timing"
+@@ -439,3 +441,29 @@ func (f fakeServiceFilter) CurrentPIDs(ebpfcommon.PIDType) map[uint32]map[app.PI
+ 	}
+ 	return f.current
+ }
++
++func TestConstantsTPParseSizeWhenLoopsSupported(t *testing.T) {
++	tracer := New(nil, &obi.Config{
++		EBPF: config.EBPFTracer{MaxRequestTPParseSizeKB: 27},
++	}, nil)
++	tracer.log = slog.Default()
++	tracer.supportsBPFLoop = true
++
++	constants := tracer.constants()
++	value, ok := constants["bpf_max_request_tp_parse_size_kb"]
++	require.True(t, ok)
++	assert.Equal(t, uint32(27), value)
++}
++
++func TestConstantsTPParseSizeWhenLoopsUnsupported(t *testing.T) {
++	tracer := New(nil, &obi.Config{
++		EBPF: config.EBPFTracer{MaxRequestTPParseSizeKB: 27},
++	}, nil)
++	tracer.log = slog.Default()
++	tracer.supportsBPFLoop = false
++
++	constants := tracer.constants()
++	value, ok := constants["bpf_max_request_tp_parse_size_kb"]
++	require.True(t, ok)
++	assert.Equal(t, uint32(0), value, "bpf_max_request_tp_parse_size_kb must be 0 on legacy kernels to prevent tail-calls into the dummy stub")
++}
+diff --git a/pkg/internal/ebpf/gotracer/gotracer.go b/pkg/internal/ebpf/gotracer/gotracer.go
+index 9f50f13..c688093 100644
+--- a/pkg/internal/ebpf/gotracer/gotracer.go
++++ b/pkg/internal/ebpf/gotracer/gotracer.go
+@@ -170,6 +170,14 @@ func (p *Tracer) constants() map[string]any {
+ 	m["postgres_max_captured_bytes"] = p.cfg.BufferSizes.Postgres
+ 	m["max_transaction_time"] = uint64(p.cfg.MaxTransactionTime.Nanoseconds())
+ 
++	if p.supportsBPFLoop {
++		m["bpf_max_request_tp_parse_size_kb"] = uint32(p.cfg.MaxRequestTPParseSizeKB)
++	} else {
++		// bpf_loop is unavailable on this kernel; set to 0 to prevent tail-calls
++		// into the dummy stubs replacing obi_parse_traceparent_http{,_append}.
++		m["bpf_max_request_tp_parse_size_kb"] = uint32(0)
++	}
++
+ 	return m
+ }
+ 
+@@ -193,6 +201,9 @@ func (p *Tracer) SetupTailCalls() {
+ 		p.bpfObjects.ObiProtocolHttp2GrpcHandleEndFrame,                 // 10
+ 		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServer,         // 11
+ 		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServerFinalize, // 12
++		// Chunked traceparent scanner
++		p.bpfObjects.ObiParseTraceparentHttp,       // 13  k_tail_parse_traceparent_http
++		p.bpfObjects.ObiParseTraceparentHttpAppend, // 14  k_tail_parse_traceparent_http_append
+ 	} {
+ 		p.log.Debug("loading program into tail call jump table", "index", i, "program", prog.String())
+ 		if err := p.bpfObjects.JumpTable.Update(uint32(i), uint32(prog.FD()), ebpf.UpdateAny); err != nil {
+@@ -830,7 +841,18 @@ func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
+ 		m["net/textproto.(*Reader).ReadMIMEHeader"] = []*ebpfcommon.ProbeDesc{{
+ 			Start: p.bpfObjects.ObiUprobeReadMimeHeader,
+ 		}}
+-	} else {
++	}
++	// Register the per-line uretprobe:
++	// - Legacy kernels (no bpf_loop): sole traceparent extraction mechanism.
++	//   Registered unconditionally to match pre-existing behavior.
++	// - Modern kernels with header tracking active: fallback for large headers
++	//   that may not be fully buffered when the readMIMEHeader entry probe fires.
++	//   double-extraction is safe: handle_traceparent_header's valid_trace guard
++	//   prevents overwriting an already-extracted traceparent.
++	// On modern kernels without header tracking this probe is skipped to avoid
++	// firing once per header line when the result would be discarded by BPF.
++	headersActive := p.cfg != nil && (p.cfg.TrackRequestHeaders || p.cfg.ContextPropagation.IsEnabled())
++	if !p.supportsBPFLoop || headersActive {
+ 		m["net/textproto.(*Reader).readContinuedLineSlice"] = []*ebpfcommon.ProbeDesc{{
+ 			End: p.bpfObjects.ObiUprobeReadContinuedLineSliceReturns,
+ 		}}
+diff --git a/pkg/obi/config.go b/pkg/obi/config.go
+index 66dc7f9..5200570 100644
+--- a/pkg/obi/config.go
++++ b/pkg/obi/config.go
+@@ -150,6 +150,7 @@ var DefaultConfig = Config{
+ 		KafkaTopicUUIDCacheSize:             1024,
+ 		CouchbaseDBCacheSize:                1024,
+ 		OverrideBPFLoopEnabled:              false,
++		MaxRequestTPParseSizeKB:             4,
+ 		PayloadExtraction: config.PayloadExtraction{
+ 			HTTP: config.HTTPConfig{
+ 				GraphQL: config.GraphQLConfig{
+diff --git a/pkg/obi/config_test.go b/pkg/obi/config_test.go
+index 23032d7..47362eb 100644
+--- a/pkg/obi/config_test.go
++++ b/pkg/obi/config_test.go
+@@ -204,8 +204,9 @@ discovery:
+ 				AsyncWriterWorkers:    8,
+ 				AsyncWriterChannelLen: 500,
+ 			},
+-			BPFFSPath:      "/sys/fs/bpf/",
+-			InstrumentCuda: config.CudaModeAuto,
++			BPFFSPath:               "/sys/fs/bpf/",
++			InstrumentCuda:          config.CudaModeAuto,
++			MaxRequestTPParseSizeKB: 4,
+ 		},
+ 		NetworkFlows: nc,
+ 		Stats:        sc,

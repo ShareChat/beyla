@@ -1,4 +1,5 @@
-ARG GEN_IMG=ghcr.io/open-telemetry/obi-generator:0.2.15@sha256:9cbb1b567377d5779b04e6bcdb87431c77a19e797b4630eba30f5417de96ea33
+# obi-generator must match the .obi-src base: v3.24.0 requires 0.2.15 (3.20/3.22 used 0.2.13/0.2.14).
+ARG GEN_IMG=ghcr.io/open-telemetry/obi-generator:0.2.15
 
 # Build JNI native library using Go image (has gcc + apt; installs cross-compiler)
 FROM golang:1.26.3@sha256:313faae491b410a35402c05d35e7518ae99103d957308e940e1ae2cfa0aac29b AS jni-builder
@@ -77,14 +78,49 @@ COPY Makefile Makefile
 COPY LICENSE LICENSE
 COPY NOTICE NOTICE
 COPY third_party_licenses.csv third_party_licenses.csv
+# ShareChat: large-header traceparent-scan backport patch, applied to .obi-src inside
+# the build. The builder does not COPY .obi-src; `make generate` re-creates it from the
+# copied .git/ submodule, so the patch must be applied AFTER that and BEFORE bindings are
+# (re)generated from the patched eBPF C.
+COPY patches/ patches/
 
 # Point make to the pre-installed bpf2go binary in the generator image
 ENV BPF2GO=/go/bin/bpf2go
 
-# Build
+# Build — ShareChat large-header traceparent-scan backport (adds the configurable
+# OTEL_EBPF_BPF_MAX_REQUEST_TP_PARSE_SIZE_KB chunked scanner) on top of the 3.24 base
+# (which also carries the readMimeHeader stale-bytes mega-trace fix).
+# The patch changes eBPF C (new split tail-call programs + a new volatile-const global),
+# so the bpf2go bindings MUST be regenerated from the patched C. Sequence:
+#   1. `make generate` — re-creates .obi-src from .git (obi-submodule) and runs the
+#      initial generation, so .obi-src + toolchain are present.
+#   2. apply the backport patch to the now-present .obi-src.
+#   3. `cd .obi-src && make generate` — regenerate bindings from the PATCHED C
+#      directly (OBI's own target; does NOT re-init/reset the submodule, so the
+#      patch is preserved). This is the step the prior build lacked.
+#   4. `make copy-obi-vendor` — `go mod vendor` copies the patched + regenerated
+#      tree into vendor/ (go.mod: `replace go.opentelemetry.io/obi => ./.obi-src`).
+# Assertions fail the build if the loader wiring or the regenerated program is absent.
 RUN if [ -z "${DEV_OBI}" ]; then \
-    /generate.sh && \
-    make copy-obi-vendor \
+    export PATH="/usr/lib/llvm22/bin:$PATH" && \
+    export BPF_CLANG=clang-22 && \
+    export BPF_CFLAGS="-O2 -g -Wall -Werror" && \
+    make generate && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0001-large-header-chunked-scan-pr1988.patch ) && \
+    ( cd .obi-src && git apply --3way --whitespace=nowarn --verbose ../patches/0002-go-strict-parent-liveness.patch ) && \
+    echo "### Asserting beya-1-patch content applied to eBPF C before generate" && \
+    grep -q "k_tail_parse_traceparent_http_append" .obi-src/bpf/generictracer/k_tracer_tailcall.h || (echo "FATAL: 0001 chunked scanner enum missing" && exit 1) && \
+    grep -q "bpf_max_request_tp_parse_size_kb" .obi-src/bpf/generictracer/protocol_http.h || (echo "FATAL: 0001 scan window missing from protocol_http.h" && exit 1) && \
+    grep -q "go_strict_parent" .obi-src/bpf/common/tracing.h || (echo "FATAL: 0002 strict-parent flag missing from tracing.h" && exit 1) && \
+    grep -q "0002: skipping non-live goroutine ctx" .obi-src/bpf/gotracer/go_common.h || (echo "FATAL: 0002 liveness gate missing from go_common.h" && exit 1) && \
+    grep -q "case g_dead:" .obi-src/bpf/gotracer/go_runtime.c || (echo "FATAL: 0002 g_dead cleanup missing from go_runtime.c" && exit 1) && \
+    grep -q "GoStrictParent" .obi-src/pkg/config/ebpf_tracer.go || (echo "FATAL: 0002 config field missing" && exit 1) && \
+    ( cd .obi-src && make generate ) && \
+    make copy-obi-vendor && \
+    echo "### Asserting beya-1-patch wiring landed in vendored OBI" && \
+    grep -rq "ObiParseTraceparentHttpAppend" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer/ || (echo "FATAL: 0001 regenerated bindings missing from generictracer" && exit 1) && \
+    grep -q "GoStrictParent" vendor/go.opentelemetry.io/obi/pkg/config/ebpf_tracer.go || (echo "FATAL: 0002 config field missing from vendored OBI" && exit 1) && \
+    grep -q "go_strict_parent" vendor/go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0002 loader wiring missing from vendored OBI" && exit 1) \
     ; fi
 
 # The Java agent is embedded at Go compile time, so the platform-specific jar
