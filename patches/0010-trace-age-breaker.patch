@@ -1,0 +1,123 @@
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index d313f67..0b17de4 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -114,21 +114,43 @@ static __always_inline u8 tp_reuse_should_break(const unsigned char *parent_id)
+ // Set from Go via OTEL_EBPF_BPF_TRACE_REUSE_THRESHOLD.
+ volatile const u32 trace_reuse_threshold;
+ 
++// beya-6-patch / 0010: trace-AGE breaker. 0 = disabled. Once this many
++// nanoseconds have passed since a trace id was FIRST adopted on this node,
++// further adoption of that trace id breaks (fresh root), regardless of count.
++// Kills long-lived mesh-cycle mega-traces whose per-node adoption rate is too
++// thin for the count threshold (prod exemplar 56d881ed: 2h17m alive, 1,162
++// server adoptions spread over 76 nodes = ~15/node, count breakers blind).
++// Legit traces finish in seconds; multi-minute batch flows fragment into
++// per-window segments - the accepted trade. Suggest 5m.
++// Set from Go via OTEL_EBPF_BPF_TRACE_REUSE_MAX_AGE (duration).
++volatile const u64 trace_reuse_max_age_ns;
++
+ // Returns 1 if this incoming TRACE id has already anchored more than
+ // trace_reuse_threshold server requests. Request-count based, not time based.
+ static __always_inline u8 trace_reuse_should_break(const unsigned char *trace_id) {
+-    if (trace_reuse_threshold == 0) {
+-        return 0; // feature disabled
++    if (trace_reuse_threshold == 0 && trace_reuse_max_age_ns == 0) {
++        return 0; // both features disabled
+     }
+     u64 key = 0;
+     __builtin_memcpy(&key, trace_id, sizeof(key)); // first 8 bytes of trace id
+     if (key == 0) {
+         return 0; // invalid/absent trace id - nothing to break
+     }
+-    u32 *cnt = bpf_map_lookup_elem(&trace_reuse_count, &key);
+-    u32 newcnt = cnt ? (*cnt + 1) : 1;
+-    bpf_map_update_elem(&trace_reuse_count, &key, &newcnt, BPF_ANY);
+-    return newcnt > trace_reuse_threshold;
++    const u64 now = bpf_ktime_get_ns();
++    trace_reuse_val_t *v = bpf_map_lookup_elem(&trace_reuse_count, &key);
++    if (!v) {
++        trace_reuse_val_t nv = {.first_seen_ns = now, .count = 1, ._pad = 0};
++        bpf_map_update_elem(&trace_reuse_count, &key, &nv, BPF_ANY);
++        return 0;
++    }
++    // 0010: age gate first - an expired trace id may not be adopted at all.
++    // No count increment on the break path; the lookup itself keeps the entry
++    // hot in the LRU so first_seen_ns is preserved while the cycle persists.
++    if (trace_reuse_max_age_ns && (now - v->first_seen_ns) > trace_reuse_max_age_ns) {
++        return 1;
++    }
++    v->count += 1; // in-place: lookup returns a live map pointer
++    return trace_reuse_threshold && v->count > trace_reuse_threshold;
+ }
+ 
+ #define TRACE_TYPE_SERVER 1
+diff --git a/bpf/maps/trace_reuse_count.h b/bpf/maps/trace_reuse_count.h
+index 187f1b6..5fa7e05 100644
+--- a/bpf/maps/trace_reuse_count.h
++++ b/bpf/maps/trace_reuse_count.h
+@@ -11,9 +11,21 @@
+ // max_entries 16384 (was 65536): see 0009 - preallocated unpinned LRU x
+ // collections exhausted kernel memory on busy nodes; active anchors are
+ // O(hundreds) so 16384 keeps ~50x headroom.
++// 0010: value carries the first-seen timestamp so adoption can also be
++// bounded by trace AGE. A slow mesh-cycle (e.g. 25 adoptions/min sprayed over
++// 76 nodes = ~15/node/2h) never trips a per-node COUNT threshold; its
++// unbounded dimension is TIME. first_seen_ns survives in the LRU as long as
++// the trace id stays hot (lookups refresh recency), which is exactly when we
++// need it.
++typedef struct trace_reuse_val {
++    u64 first_seen_ns; // bpf_ktime_get_ns() at first adoption on this node
++    u32 count;         // number of server requests that adopted this trace id
++    u32 _pad;
++} trace_reuse_val_t;
++
+ struct {
+     __uint(type, BPF_MAP_TYPE_LRU_HASH);
+-    __type(key, u64);   // first 8 bytes of the incoming trace id
+-    __type(value, u32); // number of server requests that adopted this trace id
++    __type(key, u64); // first 8 bytes of the incoming trace id
++    __type(value, trace_reuse_val_t);
+     __uint(max_entries, 16384);
+ } trace_reuse_count SEC(".maps");
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index 240f007..a8949a7 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -124,6 +124,12 @@ type EBPFTracer struct {
+ 	// ids). Should be set well above tp_reuse_threshold (e.g. 256-1024).
+ 	TraceReuseThreshold uint32 `yaml:"trace_reuse_threshold" env:"OTEL_EBPF_BPF_TRACE_REUSE_THRESHOLD"`
+ 
++	// ShareChat trace-AGE breaker: 0 disables. Once this long has passed since a
++	// trace id was first adopted on a node, further server-side adoption of that
++	// trace id mints a fresh root regardless of count (bounds long-lived
++	// mesh-cycle mega-traces too thin for the count threshold). Suggest 5m.
++	TraceReuseMaxAge time.Duration `yaml:"trace_reuse_max_age" env:"OTEL_EBPF_BPF_TRACE_REUSE_MAX_AGE"`
++
+ 	HighRequestVolume bool `yaml:"high_request_volume" env:"OTEL_EBPF_BPF_HIGH_REQUEST_VOLUME" validate:"boolean"`
+ 
+ 	// Enables the heuristic based detection of SQL requests. This can be used to detect
+diff --git a/pkg/internal/ebpf/generictracer/generictracer.go b/pkg/internal/ebpf/generictracer/generictracer.go
+index fc8ea07..c1c77b4 100644
+--- a/pkg/internal/ebpf/generictracer/generictracer.go
++++ b/pkg/internal/ebpf/generictracer/generictracer.go
+@@ -233,6 +233,7 @@ func (p *Tracer) constants() map[string]any {
+ 	m["client_reuse_threshold"] = p.cfg.EBPF.ClientReuseThreshold
+ 	m["tp_reuse_threshold"] = p.cfg.EBPF.TPReuseThreshold
+ 	m["trace_reuse_threshold"] = p.cfg.EBPF.TraceReuseThreshold
++	m["trace_reuse_max_age_ns"] = uint64(p.cfg.EBPF.TraceReuseMaxAge.Nanoseconds())
+ 
+ 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
+ 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
+diff --git a/pkg/internal/ebpf/gotracer/gotracer.go b/pkg/internal/ebpf/gotracer/gotracer.go
+index ab0a39b..5c10353 100644
+--- a/pkg/internal/ebpf/gotracer/gotracer.go
++++ b/pkg/internal/ebpf/gotracer/gotracer.go
+@@ -142,6 +142,7 @@ func (p *Tracer) constants() map[string]any {
+ 		"client_reuse_threshold":    p.cfg.ClientReuseThreshold,
+ 		"tp_reuse_threshold":        p.cfg.TPReuseThreshold,
+ 		"trace_reuse_threshold":     p.cfg.TraceReuseThreshold,
++		"trace_reuse_max_age_ns":    uint64(p.cfg.TraceReuseMaxAge.Nanoseconds()),
+ 		"g_bpf_debug":               p.cfg.BpfDebug,
+ 		"g_bpf_header_propagation":  p.supportsContextPropagation(),
+ 		"wakeup_data_bytes":         uint32(p.cfg.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{})),

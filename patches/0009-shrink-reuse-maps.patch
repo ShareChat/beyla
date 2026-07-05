@@ -1,0 +1,49 @@
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index c8d8f60..d313f67 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -50,7 +50,7 @@ struct {
+     __uint(type, BPF_MAP_TYPE_LRU_HASH);
+     __type(key, u64);   // first 8 bytes of the adopted parent span id
+     __type(value, u32); // number of client spans that adopted this parent
+-    __uint(max_entries, 65536);
++    __uint(max_entries, 16384); // 0009: was 65536 - see tp_reuse_count.h rationale
+ } client_reuse_count SEC(".maps");
+ 
+ // Returns true when this adoption would put the parent span id past
+diff --git a/bpf/maps/tp_reuse_count.h b/bpf/maps/tp_reuse_count.h
+index 36d62e4..5bb162b 100644
+--- a/bpf/maps/tp_reuse_count.h
++++ b/bpf/maps/tp_reuse_count.h
+@@ -7,9 +7,12 @@
+ // incoming parent span id. Used to bound unbounded trace-context reuse
+ // (a reused/sticky/looped parent merging thousands of requests into one trace).
+ // LRU bounds memory and evicts cold anchors.
++// max_entries 16384 (was 65536): see 0009 - preallocated unpinned LRU x
++// collections exhausted kernel memory on busy nodes; active anchors are
++// O(hundreds) so 16384 keeps ~50x headroom.
+ struct {
+     __uint(type, BPF_MAP_TYPE_LRU_HASH);
+     __type(key, u64);   // first 8 bytes of the incoming parent span id
+     __type(value, u32); // number of server requests that adopted this parent
+-    __uint(max_entries, 65536);
++    __uint(max_entries, 16384);
+ } tp_reuse_count SEC(".maps");
+diff --git a/bpf/maps/trace_reuse_count.h b/bpf/maps/trace_reuse_count.h
+index e3bc736..187f1b6 100644
+--- a/bpf/maps/trace_reuse_count.h
++++ b/bpf/maps/trace_reuse_count.h
+@@ -8,9 +8,12 @@
+ // one trace id circulates between services via individually-legit hops with a
+ // fresh parent span id each time (invisible to the per-parent tp_reuse_count).
+ // LRU bounds memory and evicts cold trace ids.
++// max_entries 16384 (was 65536): see 0009 - preallocated unpinned LRU x
++// collections exhausted kernel memory on busy nodes; active anchors are
++// O(hundreds) so 16384 keeps ~50x headroom.
+ struct {
+     __uint(type, BPF_MAP_TYPE_LRU_HASH);
+     __type(key, u64);   // first 8 bytes of the incoming trace id
+     __type(value, u32); // number of server requests that adopted this trace id
+-    __uint(max_entries, 65536);
++    __uint(max_entries, 16384);
+ } trace_reuse_count SEC(".maps");
