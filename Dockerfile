@@ -155,7 +155,7 @@ RUN if [ -z "${DEV_OBI}" ]; then \
     grep -q "trace_reuse_max_age_ns" .obi-src/pkg/internal/ebpf/gotracer/gotracer.go || (echo "FATAL: 0010 go wiring missing" && exit 1) && \
     grep -q "trace_age_expired" .obi-src/bpf/common/tracing.h || (echo "FATAL: 0011 age-expired helper missing" && exit 1) && \
     grep -q "0011: aged reused server ctx" .obi-src/bpf/generictracer/protocol_http.h || (echo "FATAL: 0011 generic server reuse guard missing" && exit 1) && \
-    grep -qc "trace_age_expired" .obi-src/bpf/gotracer/go_common.h | grep -q "^2$" || (echo "FATAL: 0011 go_common.h reuse guards != 2" && exit 1) && \
+    grep -c "trace_age_expired" .obi-src/bpf/gotracer/go_common.h | grep -q "^2$" || (echo "FATAL: 0011 go_common.h reuse guards != 2" && exit 1) && \
     ( cd .obi-src && make generate ) && \
     make copy-obi-vendor && \
     echo "### Asserting beya-1-patch wiring landed in vendored OBI" && \
