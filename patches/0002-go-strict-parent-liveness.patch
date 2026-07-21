@@ -1,0 +1,109 @@
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index 2469735..d6df1a4 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -15,6 +15,18 @@
+ 
+ volatile const u32 disable_black_box_cp;
+ 
++// beya-1-patch / 0002: strict per-request parent resolution for the Go tracer.
++// Trace context (own goroutine entry OR ancestor entry) may only be adopted
++// while that goroutine currently has a LIVE in-flight server invocation
++// (present in ongoing_http_server_requests / ongoing_grpc_server_requests).
++// A goroutine that is not serving anything (Kafka producer/logger goroutine,
++// Temporal poller, connection-serving goroutine between requests, worker pool)
++// cannot donate its stale context - the client call mints a fresh trace
++// instead. Deterministic and timeout-free. Closes the frozen-anchor and
++// self-chain mega-trace classes. 0 = disabled (stock behavior).
++// Set via OTEL_EBPF_BPF_GO_STRICT_PARENT.
++volatile const u32 go_strict_parent;
++
+ #define TRACE_TYPE_SERVER 1
+ #define TRACE_TYPE_CLIENT 2
+ 
+diff --git a/bpf/gotracer/go_common.h b/bpf/gotracer/go_common.h
+index 26b03f1..f578fff 100644
+--- a/bpf/gotracer/go_common.h
++++ b/bpf/gotracer/go_common.h
+@@ -29,6 +29,8 @@
+ #include <gotracer/go_offsets.h>
+ 
+ #include <gotracer/maps/handled_by_go.h>
++#include <gotracer/maps/nethttp.h>
++#include <gotracer/maps/grpc.h>
+ 
+ #include <logger/bpf_dbg.h>
+ 
+@@ -159,6 +161,17 @@ static __always_inline u64 find_parent_goroutine(go_addr_key_t *current) {
+     int attempts = 0;
+     do {
+         tp_info_t *p_inv = bpf_map_lookup_elem(&go_trace_map, parent);
++        // 0002: in strict mode, a context entry (the goroutine's OWN included -
++        // a long-lived goroutine can chain its own client contexts) is only
++        // adoptable while that goroutine has a live in-flight server
++        // invocation. Non-live entries are treated as absent: keep climbing;
++        // exhausting ancestry returns 0 and the caller mints a fresh trace.
++        if (p_inv && go_strict_parent &&
++            !bpf_map_lookup_elem(&ongoing_http_server_requests, parent) &&
++            !bpf_map_lookup_elem(&ongoing_grpc_server_requests, parent)) {
++            bpf_dbg_printk("0002: skipping non-live goroutine ctx, r_addr=%lx", r_addr);
++            p_inv = 0;
++        }
+         if (!p_inv) { // not this goroutine running the server request processing
+             // Let's find the parent scope
+             goroutine_metadata *g_metadata =
+diff --git a/bpf/gotracer/go_runtime.c b/bpf/gotracer/go_runtime.c
+index 4926cd5..2cb9627 100644
+--- a/bpf/gotracer/go_runtime.c
++++ b/bpf/gotracer/go_runtime.c
+@@ -670,6 +670,16 @@ int obi_uprobe_runtime_casgstatus(struct pt_regs *ctx) {
+             return 0;
+         }
+ 
++        break;
++    case g_dead:
++        // 0002: a dead goroutine cannot own a request; its context must not
++        // remain adoptable by the ancestry climb. Only g_dead - NOT default,
++        // which also catches g_waiting (normal blocking, context still live).
++        if (go_strict_parent) {
++            bpf_map_delete_elem(&go_trace_map, &g_key);
++            bpf_map_delete_elem(&ongoing_goroutines, &g_key);
++        }
++        obi_ctx__del(g_pid_tgid);
+         break;
+     default:
+         obi_ctx__del(g_pid_tgid);
+diff --git a/pkg/config/ebpf_tracer.go b/pkg/config/ebpf_tracer.go
+index 7a7082f..806b30d 100644
+--- a/pkg/config/ebpf_tracer.go
++++ b/pkg/config/ebpf_tracer.go
+@@ -92,6 +92,11 @@ type EBPFTracer struct {
+ 	DisableBlackBoxCP bool `yaml:"disable_black_box_cp" env:"OTEL_EBPF_BPF_DISABLE_BLACK_BOX_CP" validate:"boolean"`
+ 
+ 	// Optimizes for getting requests information immediately when request response is seen
++	// Strict per-request parent resolution for the Go tracer: adopt a
++	// goroutine's trace context only while it has a live in-flight server
++	// invocation; otherwise mint a fresh trace. Deterministic, timeout-free.
++	GoStrictParent bool `yaml:"go_strict_parent" env:"OTEL_EBPF_BPF_GO_STRICT_PARENT" validate:"boolean"`
++
+ 	HighRequestVolume bool `yaml:"high_request_volume" env:"OTEL_EBPF_BPF_HIGH_REQUEST_VOLUME" validate:"boolean"`
+ 
+ 	// Enables the heuristic based detection of SQL requests. This can be used to detect
+diff --git a/pkg/internal/ebpf/gotracer/gotracer.go b/pkg/internal/ebpf/gotracer/gotracer.go
+index c688093..fe92d8f 100644
+--- a/pkg/internal/ebpf/gotracer/gotracer.go
++++ b/pkg/internal/ebpf/gotracer/gotracer.go
+@@ -132,7 +132,13 @@ func (p *Tracer) constants() map[string]any {
+ 		blackBoxCP = uint32(1)
+ 	}
+ 
++	goStrictParent := uint32(0)
++	if p.cfg.GoStrictParent {
++		goStrictParent = uint32(1)
++	}
++
+ 	m := map[string]any{
++		"go_strict_parent":          goStrictParent,
+ 		"g_bpf_debug":               p.cfg.BpfDebug,
+ 		"g_bpf_header_propagation":  p.supportsContextPropagation(),
+ 		"wakeup_data_bytes":         uint32(p.cfg.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{})),

@@ -1,0 +1,47 @@
+diff --git a/bpf/tpinjector/tpinjector.c b/bpf/tpinjector/tpinjector.c
+index 92ac8bb..15f3a15 100644
+--- a/bpf/tpinjector/tpinjector.c
++++ b/bpf/tpinjector/tpinjector.c
+@@ -362,6 +362,20 @@ static __always_inline void init_tp_ctx_parent_tp(tailcall_ctx *t_ctx) {
+ 
+     t_ctx->has_parent_tp = find_parent_trace_for_client_request(
+         &t_ctx->p_conn, t_ctx->p_conn.conn.d_port, k_lw_thread_none, &t_ctx->parent_tp);
++
++    // 0006: bound how many INJECTED requests/streams may ride one parent span.
++    // The parent here is the thread/connection-resolved server context; a live
++    // anchor otherwise donates its trace id to every stream on the connection
++    // (fresh random span id per stream = phantom parents downstream: the
++    // 349-request response-side welds and the nginx 1fb05cc3 class). Same
++    // counter helper as 0004/0005; this program's map instance is its own
++    // (no pinning), so injection and span-identity adoptions are counted
++    // independently.
++    if (t_ctx->has_parent_tp &&
++        client_reuse_should_break_key(*((u64 *)t_ctx->parent_tp.span_id))) {
++        bpf_dbg_printk("0006: injector parent ctx past reuse threshold, generating fresh");
++        t_ctx->has_parent_tp = false;
++    }
+ }
+ 
+ static __always_inline bool create_trace_info(const tailcall_ctx *t_ctx, tp_info_pid_t *tp_p) {
+diff --git a/pkg/internal/ebpf/tpinjector/tpinjector.go b/pkg/internal/ebpf/tpinjector/tpinjector.go
+index 1946e64..5c431bb 100644
+--- a/pkg/internal/ebpf/tpinjector/tpinjector.go
++++ b/pkg/internal/ebpf/tpinjector/tpinjector.go
+@@ -98,11 +98,12 @@ func (p *Tracer) constants() map[string]any {
+ 	}
+ 
+ 	return map[string]any{
+-		"filter_pids":          filterPids,
+-		"max_transaction_time": uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
+-		"inject_flags":         flags,
+-		"g_bpf_debug":          p.cfg.EBPF.BpfDebug,
+-		"disable_h2_tp_adopt":  disableH2TpAdopt,
++		"filter_pids":            filterPids,
++		"max_transaction_time":   uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
++		"inject_flags":           flags,
++		"g_bpf_debug":            p.cfg.EBPF.BpfDebug,
++		"disable_h2_tp_adopt":    disableH2TpAdopt,
++		"client_reuse_threshold": p.cfg.EBPF.ClientReuseThreshold,
+ 	}
+ }
+ 

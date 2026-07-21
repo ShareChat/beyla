@@ -1,0 +1,83 @@
+diff --git a/bpf/common/tracing.h b/bpf/common/tracing.h
+index 0b17de4..74d5e04 100644
+--- a/bpf/common/tracing.h
++++ b/bpf/common/tracing.h
+@@ -153,6 +153,33 @@ static __always_inline u8 trace_reuse_should_break(const unsigned char *trace_id
+     return trace_reuse_threshold && v->count > trace_reuse_threshold;
+ }
+ 
++// beya-7-patch / 0011: pure age check for a trace id being REUSED from a stored
++// context map (connection/thread/goroutine reuse). Those reuse-read paths never
++// call trace_reuse_should_break (which only guards fresh header adoption), so a
++// long-lived reused context leaks past the age limit (measured -03 tail: single
++// node adopting one trace id's server spans for 500-800s under a 120s cap).
++// Establishes first_seen on first sighting (no count increment - counting stays
++// with the adoption sites), then reports expiry. Returns 1 => caller should mint
++// a fresh root instead of reusing the aged context.
++static __always_inline u8 trace_age_expired(const unsigned char *trace_id) {
++    if (trace_reuse_max_age_ns == 0) {
++        return 0; // age feature disabled
++    }
++    u64 key = 0;
++    __builtin_memcpy(&key, trace_id, sizeof(key));
++    if (key == 0) {
++        return 0;
++    }
++    const u64 now2 = bpf_ktime_get_ns();
++    trace_reuse_val_t *v = bpf_map_lookup_elem(&trace_reuse_count, &key);
++    if (!v) {
++        trace_reuse_val_t nv = {.first_seen_ns = now2, .count = 0, ._pad = 0};
++        bpf_map_update_elem(&trace_reuse_count, &key, &nv, BPF_ANY);
++        return 0;
++    }
++    return (now2 - v->first_seen_ns) > trace_reuse_max_age_ns;
++}
++
+ #define TRACE_TYPE_SERVER 1
+ #define TRACE_TYPE_CLIENT 2
+ 
+diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
+index 5cd2df3..1d36d12 100644
+--- a/bpf/generictracer/protocol_http.h
++++ b/bpf/generictracer/protocol_http.h
+@@ -421,6 +421,14 @@ static __always_inline int __obi_continue2_protocol_http(struct pt_regs *ctx,
+                 bpf_dbg_printk("overwriting parent id from the self referencing client request");
+                 __builtin_memcpy(&info->tp.parent_id, &args->self_ref_parent_id, sizeof(u64));
+             }
++            // 0011: SERVER connection-context reuse bypasses the fresh-adoption
++            // age gate; if the reused trace id has outlived the age limit on
++            // this node, mint a fresh root instead of extending the weld.
++            if (type == TRACE_TYPE_SERVER && trace_age_expired(info->tp.trace_id)) {
++                bpf_dbg_printk("0011: aged reused server ctx, minting fresh root");
++                new_trace_id(&info->tp);
++                __builtin_memset(info->tp.parent_id, 0, sizeof(info->tp.parent_id));
++            }
+         } else {
+             bpf_dbg_printk("Can't find trace info, this is a bug!");
+         }
+diff --git a/bpf/gotracer/go_common.h b/bpf/gotracer/go_common.h
+index eb033be..1e853de 100644
+--- a/bpf/gotracer/go_common.h
++++ b/bpf/gotracer/go_common.h
+@@ -272,6 +272,10 @@ server_trace_parent(void *goroutine_addr, tp_info_t *tp, tp_info_t *found_tp) {
+                 found_info = 1;
+                 tp_from_parent(tp, &existing_tp->tp);
+                 bpf_map_delete_elem(&incoming_trace_map, &conn);
++                // 0011: aged reused (TCP-CP) context -> fall through to fresh mint
++                if (trace_age_expired(tp->trace_id)) {
++                    found_info = 0;
++                }
+             } else {
+                 // If not, we then look up the information in the black-box context map - same node.
+                 bpf_dbg_printk("Looking up traceparent for connection info");
+@@ -281,6 +285,10 @@ server_trace_parent(void *goroutine_addr, tp_info_t *tp, tp_info_t *found_tp) {
+                         bpf_dbg_printk("Found traceparent from trace map, another process.");
+                         found_info = 1;
+                         tp_from_parent(tp, &tp_p->tp);
++                        // 0011: aged reused (black-box) context -> fresh mint
++                        if (trace_age_expired(tp->trace_id)) {
++                            found_info = 0;
++                        }
+                     }
+                 }
+             }
